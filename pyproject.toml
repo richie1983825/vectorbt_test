@@ -1,0 +1,10 @@
+[project]
+name = "vectorbt-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyarrow>=24.0.0",
+    "vectorbt[full,rust]>=1.0.0",
+]
