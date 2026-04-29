@@ -5,9 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 环境
 
 - 操作系统：WSL2 Debian (Linux 6.6.87-microsoft-standard-WSL2)
-- Python 版本：3.14，通过 `.python-version` 管理
+- Python 版本：3.13，通过 `.python-version` 管理
 - 包管理：UV (`uv` / `uv pip` / `uv run`)，不要使用裸 `pip` 或 `python`
 - 虚拟环境位于项目根目录 `.venv/`
+- 注意：若 shell 环境设置了 `VIRTUAL_ENV` 指向其他 Python 版本，运行 `uv` 命令前需 `unset VIRTUAL_ENV`，否则会有 warning（不影响执行结果）
 
 ## 常用命令
 

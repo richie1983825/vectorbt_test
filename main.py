@@ -1,11 +1,13 @@
 """
-VectorBT parameter scanning for dynamic grid strategies.
+VectorBT parameter scanning for dynamic grid strategies — with CUDA/GPU support.
 
 Reimplements PolyfitDynamicGridStrategy and MovingAverageDynamicGridStrategy
 logic using VectorBT for portfolio backtesting and parameter optimization.
 """
 
 from itertools import product
+import os
+import subprocess
 from typing import Tuple
 
 import numpy as np
@@ -16,10 +18,87 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════════════════
-# Data
+# GPU / CUDA detection
+# ══════════════════════════════════════════════════════════════════
+
+_gpu_info: dict = {}
+
+
+def detect_gpu() -> dict:
+    """Detect NVIDIA GPU and CUDA capabilities (idempotent)."""
+    global _gpu_info
+    if _gpu_info:
+        return _gpu_info
+
+    info = {
+        "gpu_detected": False,
+        "gpu_name": "N/A",
+        "memory_mb": 0,
+        "compute_cap": "N/A",
+        "cupy_available": False,
+        "cupy_version": "N/A",
+        "xp": np,  # default array module
+    }
+
+    # --- nvidia-smi detection ---
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts = [p.strip() for p in r.stdout.strip().split(",")]
+            info["gpu_name"] = parts[0] if len(parts) > 0 else "N/A"
+            mem_str = parts[1] if len(parts) > 1 else "0 MiB"
+            info["memory_mb"] = int(mem_str.replace("MiB", "").strip()) if "MiB" in mem_str else 0
+            info["compute_cap"] = parts[2] if len(parts) > 2 else "N/A"
+            info["gpu_detected"] = True
+    except Exception:
+        pass
+
+    # --- CuPy detection ---
+    try:
+        import cupy as cp
+        # Test that JIT compilation actually works (not just import)
+        _test = cp.arange(10, dtype=cp.float64)
+        _ = cp.cumsum(_test)
+        info["cupy_available"] = True
+        info["cupy_version"] = cp.__version__
+        info["xp"] = cp
+    except Exception:
+        pass
+
+    _gpu_info = info
+    return info
+
+
+def gpu() -> dict:
+    """Return cached GPU info (call detect_gpu first)."""
+    return _gpu_info or detect_gpu()
+
+
+def xp():
+    """Return cupy if CUDA is available, else numpy."""
+    return gpu()["xp"]
+
+
+def print_gpu_info(info: dict) -> None:
+    print(f"GPU: {info['gpu_name']}")
+    print(f"  Memory:      {info['memory_mb']} MiB")
+    print(f"  Compute Cap: {info['compute_cap']}")
+    if info["cupy_available"]:
+        print(f"  CuPy:        {info['cupy_version']}  ✓ (GPU acceleration enabled)")
+    else:
+        print(f"  CuPy:        not installed (CPU-only mode)")
+
+
+# ══════════════════════════════════════════════════════════════════
+# Data & output paths
 # ══════════════════════════════════════════════════════════════════
 
 DATA_PATH = "data/512890.SH_hfq.parquet"
+REPORTS_DIR = "reports"
 
 
 def load_data(path: str = DATA_PATH) -> pd.DataFrame:
@@ -50,7 +129,22 @@ def rolling_linear_fit_pred(series: pd.Series, window: int) -> pd.Series:
 
 
 def compute_rolling_volatility(close: pd.Series, window: int = 20) -> pd.Series:
+    """Rolling volatility (std of returns).  GPU-accelerated via CuPy when available."""
     returns = close.pct_change()
+    if gpu()["cupy_available"]:
+        cp = xp()
+        ret = cp.asarray(returns.values, dtype=cp.float64)
+        # GPU rolling std via convolution: std = sqrt(E[X²] - E[X]²)
+        ones = cp.ones(window, dtype=cp.float64)
+        sum_ret = cp.convolve(ret, ones, mode="same")
+        sum_ret2 = cp.convolve(ret * ret, ones, mode="same")
+        mask = cp.arange(len(ret)) >= window - 1
+        mean_ret = cp.where(mask, sum_ret / window, cp.nan)
+        mean_ret2 = cp.where(mask, sum_ret2 / window, cp.nan)
+        var = cp.maximum(mean_ret2 - mean_ret * mean_ret, 0.0)
+        result = pd.Series(cp.asnumpy(cp.sqrt(var)), index=returns.index)
+        result.iloc[:window - 1] = np.nan
+        return result
     return returns.rolling(window).std()
 
 
@@ -119,7 +213,7 @@ def generate_grid_signals(
     position_size: float = np.inf,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generate entry/exitsignals bar by bar, replicating the original strategy's
+    Generate entry/exit signals bar by bar, replicating the original strategy's
     `next()` logic.
 
     Returns entries, exits, sizes arrays.
@@ -294,7 +388,122 @@ def scan_ma_strategy(close: pd.Series) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════
-# Reporting
+# Report generation
+# ══════════════════════════════════════════════════════════════════
+
+def generate_portfolio_reports(
+    close: pd.Series,
+    entries: np.ndarray,
+    exits: np.ndarray,
+    sizes: np.ndarray,
+    name: str,
+    params: dict,
+) -> dict:
+    """Generate VectorBT plots and stats for a single parameter set."""
+    pf = vbt.Portfolio.from_signals(
+        close,
+        entries=pd.Series(entries, index=close.index),
+        exits=pd.Series(exits, index=close.index),
+        size=pd.Series(sizes, index=close.index),
+        size_type="percent",
+        init_cash=100_000.0,
+        freq="D",
+    )
+
+    safe_name = name.replace(" ", "_")
+
+    # --- Stats CSV ---
+    stats = pf.stats()
+    stats_path = f"{REPORTS_DIR}/{safe_name}_stats.csv"
+    stats.to_csv(stats_path)
+    print(f"  Stats → {stats_path}")
+
+    # --- Main overview plot (interactive HTML) ---
+    fig = pf.plot()
+    fig_path = f"{REPORTS_DIR}/{safe_name}_overview.html"
+    fig.write_html(fig_path)
+    print(f"  Overview plot → {fig_path}")
+
+    # --- Individual plots ---
+    plot_methods = [
+        ("cum_returns", pf.plot_cum_returns),
+        ("drawdowns", pf.plot_drawdowns),
+        ("underwater", pf.plot_underwater),
+        ("trades", pf.plot_trades),
+        ("trade_pnl", pf.plot_trade_pnl),
+        ("asset_value", pf.plot_asset_value),
+    ]
+    saved_plots = []
+    for plot_name, plot_fn in plot_methods:
+        try:
+            f = plot_fn()
+            p = f"{REPORTS_DIR}/{safe_name}_{plot_name}.html"
+            f.write_html(p)
+            saved_plots.append((plot_name, f"{safe_name}_{plot_name}.html"))
+        except Exception:
+            pass
+
+    return {
+        "name": name,
+        "params": params,
+        "stats": stats.to_dict(),
+        "overview_html": f"{safe_name}_overview.html",
+        "plots": saved_plots,
+    }
+
+
+def build_index_html(reports: list[dict]) -> str:
+    """Build a simple index.html linking to all reports."""
+    rows = []
+    for r in reports:
+        s = r["stats"]
+        param_str = "  |  ".join(f"{k}={v}" for k, v in r["params"].items())
+        rows.append(f"""
+        <tr>
+            <td><strong>{r['name']}</strong></td>
+            <td>{param_str}</td>
+            <td>{s.get('Total Return [%]', 0):.2f}%</td>
+            <td>{s.get('Sharpe Ratio', 0):.3f}</td>
+            <td>{s.get('Max Drawdown [%]', 0):.2f}%</td>
+            <td>{s.get('Total Trades', 0)}</td>
+            <td><a href="{r['overview_html']}">Overview</a></td>
+            <td>{" | ".join(f'<a href="{p[1]}">{p[0]}</a>' for p in r['plots'])}</td>
+        </tr>""")
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>VectorBT Strategy Reports — 512890.SH</title>
+<style>
+  body {{ font-family: -apple-system, 'Segoe UI', sans-serif; margin: 2em; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+  th {{ background: #f5f5f5; }}
+  a {{ color: #1a73e8; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  h1 {{ margin-bottom: 0.5em; }}
+  .subtitle {{ color: #666; margin-bottom: 1.5em; }}
+</style>
+</head>
+<body>
+<h1>VectorBT Dynamic Grid Strategy Reports</h1>
+<p class="subtitle">512890.SH 后复权  |  Best-parameter backtests from grid search</p>
+<table>
+<thead>
+<tr><th>Strategy</th><th>Parameters</th><th>Total Return</th><th>Sharpe</th>
+<th>Max DD</th><th>Trades</th><th>Overview</th><th>Detail Plots</th></tr>
+</thead>
+<tbody>
+{"".join(rows)}
+</tbody>
+</table>
+</body>
+</html>"""
+
+
+# ══════════════════════════════════════════════════════════════════
+# Scan-result display
 # ══════════════════════════════════════════════════════════════════
 
 def print_top(results: pd.DataFrame, name: str, param_cols: list[str], top_n: int = 10):
@@ -318,24 +527,89 @@ def print_top(results: pd.DataFrame, name: str, param_cols: list[str], top_n: in
 # ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+
+    # --- GPU detection ---
+    gpu_info = detect_gpu()
+    print_gpu_info(gpu_info)
+    print()
+
+    # --- Load data ---
     print("Loading data…")
     df = load_data()
     close = df["Close"]
     print(f"  {len(df)} bars  |  {df.index[0].date()} → {df.index[-1].date()}")
 
+    # --- Remove old root-level CSVs from previous runs ---
+    for old_csv in ["polyfit_scan_results.csv", "ma_scan_results.csv"]:
+        if os.path.exists(old_csv):
+            os.remove(old_csv)
+            print(f"  Removed stale {old_csv} from project root")
+
     # --- Polyfit scan ---
     pf_results = scan_polyfit_strategy(close)
-    pf_results.to_csv("polyfit_scan_results.csv", index=False)
+    pf_results.to_csv(f"{REPORTS_DIR}/polyfit_scan_results.csv", index=False)
     print_top(pf_results, "PolyfitDynamicGridStrategy",
               ["polyfit_window", "base_grid_pct", "volatility_scale",
                "trend_sensitivity", "take_profit_grid", "stop_loss_grid"])
 
     # --- MA scan ---
     ma_results = scan_ma_strategy(close)
-    ma_results.to_csv("ma_scan_results.csv", index=False)
+    ma_results.to_csv(f"{REPORTS_DIR}/ma_scan_results.csv", index=False)
     print_top(ma_results, "MovingAverageDynamicGridStrategy",
               ["ma_window", "base_grid_pct", "volatility_scale",
                "trend_sensitivity", "take_profit_grid", "stop_loss_grid"])
 
-    print("\nDone. Results saved to polyfit_scan_results.csv and ma_scan_results.csv")
+    # --- Generate VectorBT reports for best parameters ---
+    print(f"\n{'='*60}")
+    print("Generating VectorBT reports for best parameters…")
+    print(f"{'='*60}")
 
+    reports_data = []
+
+    # Best Polyfit
+    best_pf = pf_results.nlargest(1, "total_return").iloc[0]
+    pf_indicators = compute_polyfit_indicators(close, polyfit_window=int(best_pf["polyfit_window"]))
+    pf_e, pf_x, pf_s = generate_grid_signals(
+        close.values, pf_indicators["PolyDevPct"].values,
+        pf_indicators["PolyDevTrend"].values, pf_indicators["RollingVolPct"].values,
+        base_grid_pct=best_pf["base_grid_pct"], volatility_scale=best_pf["volatility_scale"],
+        trend_sensitivity=best_pf["trend_sensitivity"], take_profit_grid=best_pf["take_profit_grid"],
+        stop_loss_grid=best_pf["stop_loss_grid"],
+    )
+    reports_data.append(generate_portfolio_reports(close, pf_e, pf_x, pf_s, "Polyfit", {
+        "polyfit_window": int(best_pf["polyfit_window"]),
+        "base_grid_pct": best_pf["base_grid_pct"],
+        "volatility_scale": best_pf["volatility_scale"],
+        "trend_sensitivity": best_pf["trend_sensitivity"],
+        "take_profit_grid": best_pf["take_profit_grid"],
+        "stop_loss_grid": best_pf["stop_loss_grid"],
+    }))
+
+    # Best MA
+    best_ma = ma_results.nlargest(1, "total_return").iloc[0]
+    ma_indicators = compute_ma_indicators(close, ma_window=int(best_ma["ma_window"]))
+    ma_e, ma_x, ma_s = generate_grid_signals(
+        close.values, ma_indicators["MADevPct"].values,
+        ma_indicators["MADevTrend"].values, ma_indicators["RollingVolPct"].values,
+        base_grid_pct=best_ma["base_grid_pct"], volatility_scale=best_ma["volatility_scale"],
+        trend_sensitivity=best_ma["trend_sensitivity"], take_profit_grid=best_ma["take_profit_grid"],
+        stop_loss_grid=best_ma["stop_loss_grid"],
+    )
+    reports_data.append(generate_portfolio_reports(close, ma_e, ma_x, ma_s, "MA", {
+        "ma_window": int(best_ma["ma_window"]),
+        "base_grid_pct": best_ma["base_grid_pct"],
+        "volatility_scale": best_ma["volatility_scale"],
+        "trend_sensitivity": best_ma["trend_sensitivity"],
+        "take_profit_grid": best_ma["take_profit_grid"],
+        "stop_loss_grid": best_ma["stop_loss_grid"],
+    }))
+
+    # Build index.html
+    index_html = build_index_html(reports_data)
+    index_path = f"{REPORTS_DIR}/index.html"
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(index_html)
+    print(f"  Index → {index_path}")
+
+    print(f"\nDone. Reports saved to {REPORTS_DIR}/")
