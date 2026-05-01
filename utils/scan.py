@@ -1,4 +1,10 @@
-"""Common parameter scan logic and result display."""
+"""参数扫描通用逻辑。
+
+提供 indicator_and_scan 函数，封装了"计算指标 → 生成信号 → 回测 → 收集结果"
+的完整扫描流程，支持 GPU 批量模式和 CPU 逐组合模式。
+
+执行模型：默认使用次日开盘价成交（消除前视偏差）。
+"""
 
 from itertools import product
 
@@ -22,11 +28,28 @@ def indicator_and_scan(
     slg_values: list[float],
     signal_fn,
     signal_batch_fn,
+    open_: pd.Series | None = None,  # 开盘价，用于 next-bar Open 成交
 ) -> pd.DataFrame:
-    """Shared scan loop for grid-based strategies.
+    """网格策略通用参数扫描。
 
-    When CuPy is available, uses GPU-batched signal generation AND backtest.
-    Otherwise falls back to CPU per-combo loop for both.
+    对给定的参数候选集做全排列扫描。当 CuPy 可用且 signal_batch_fn 不为 None 时：
+      - 同一 MA 窗口下，所有参数组合的指标数据相同
+      - 批量信号生成 + 批量回测（GPU）
+
+    成交执行：传入 open_ 则使用 next-bar Open 成交（消除前视偏差）。
+
+    Args:
+        close:              收盘价序列
+        indicator_fn:       指标计算函数，签名为 (close, window) → DataFrame
+        window_param_name:  窗口参数列名
+        windows:            MA 窗口候选列表
+        grid_pcts ~ slg_values: 网格策略各参数候选列表
+        signal_fn:          CPU 信号生成函数
+        signal_batch_fn:    GPU 批量信号生成函数
+        open_:              可选，开盘价序列，用于 next-bar Open 执行
+
+    Returns:
+        DataFrame，每行包含一组参数的指标结果。
     """
     total = (
         len(windows) * len(grid_pcts) * len(vol_scales)
@@ -35,6 +58,9 @@ def indicator_and_scan(
     results = []
     count = 0
     use_gpu = gpu()["cupy_available"]
+
+    # 准备 numpy 版本的 Open 数据（GPU 路径用）
+    open_arr = open_.values if open_ is not None else None
 
     for w in windows:
         indicators = indicator_fn(close, w)
@@ -48,7 +74,7 @@ def indicator_and_scan(
         ))
 
         if use_gpu and signal_batch_fn is not None:
-            # --- GPU: batch signal generation ---
+            # ── GPU 路径：批量信号生成 + 批量回测 ──
             bgp_a = np.array([p[0] for p in param_combos])
             vs_a = np.array([p[1] for p in param_combos])
             ts_a = np.array([p[2] for p in param_combos])
@@ -60,15 +86,15 @@ def indicator_and_scan(
                 bgp_a, vs_a, ts_a, tpg_a, slg_a,
             )
 
-            # --- GPU: batch backtest ---
             bt_metrics = run_backtest_batch(
                 close_arr, entries_b, exits_b, sizes_b,
                 n_combos=len(param_combos),
+                open_=open_arr,
             )
 
             for idx, (bgp, vs, ts, tpg, slg) in enumerate(param_combos):
                 row = bt_metrics[idx]
-                if int(row[4]) == 0:  # num_trades == 0
+                if int(row[4]) == 0:
                     continue
 
                 metrics = {
@@ -86,11 +112,9 @@ def indicator_and_scan(
                     "stop_loss_grid": slg,
                 }
                 results.append(metrics)
-
                 count += 1
-                # progress silent in batch mode
         else:
-            # --- CPU fallback ---
+            # ── CPU 路径：逐组合循环 ──
             for bgp, vs, ts, tpg, slg in param_combos:
                 entries, exits, sizes = signal_fn(
                     close_arr, dev_pct_arr, dev_trend_arr, vol_arr,
@@ -102,7 +126,7 @@ def indicator_and_scan(
                 if entries.sum() == 0:
                     continue
 
-                metrics = run_backtest(close, entries, exits, sizes)
+                metrics = run_backtest(close, entries, exits, sizes, open_=open_)
                 metrics[window_param_name] = w
                 metrics["base_grid_pct"] = bgp
                 metrics["volatility_scale"] = vs
@@ -110,14 +134,13 @@ def indicator_and_scan(
                 metrics["take_profit_grid"] = tpg
                 metrics["stop_loss_grid"] = slg
                 results.append(metrics)
-
                 count += 1
-                # progress silent in batch mode
 
     return pd.DataFrame(results)
 
 
 def print_top(results: pd.DataFrame, name: str, param_cols: list[str], top_n: int = 10):
+    """格式化打印扫描结果的 Top N（按 Total Return 排序）。"""
     print(f"\n{'=' * 80}")
     print(f"  {name} — Top {top_n} by Total Return")
     print(f"{'=' * 80}")

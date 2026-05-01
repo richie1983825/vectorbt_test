@@ -1,14 +1,32 @@
-"""GPU / CUDA detection and utilities."""
+"""GPU / CUDA 检测与工具函数。
+
+提供统一的 GPU 检测、CuPy 导入和状态查询接口。
+其他模块通过 xp() 获取 cupy（GPU）或 numpy（CPU）的统一数组接口。
+"""
 
 import subprocess
 
 import numpy as np
 
+# 缓存 GPU 检测结果，避免重复查询 nvidia-smi
 _gpu_info: dict = {}
 
 
 def detect_gpu() -> dict:
-    """Detect NVIDIA GPU and CUDA capabilities (idempotent)."""
+    """检测 NVIDIA GPU 和 CUDA 环境（幂等操作，结果缓存）。
+
+    通过 nvidia-smi 获取 GPU 硬件信息，通过尝试导入 cupy 检测 CUDA 运行时。
+
+    Returns:
+        dict 包含:
+          - gpu_detected:    是否检测到 NVIDIA GPU
+          - gpu_name:        GPU 型号名称
+          - memory_mb:       显存大小（MiB）
+          - compute_cap:     计算能力版本
+          - cupy_available:  CuPy 是否可用
+          - cupy_version:    CuPy 版本号
+          - xp:              cupy 模块（可用时）或 numpy（不可用时）
+    """
     global _gpu_info
     if _gpu_info:
         return _gpu_info
@@ -20,10 +38,10 @@ def detect_gpu() -> dict:
         "compute_cap": "N/A",
         "cupy_available": False,
         "cupy_version": "N/A",
-        "xp": np,
+        "xp": np,  # 默认使用 numpy
     }
 
-    # --- nvidia-smi detection ---
+    # ── 通过 nvidia-smi 获取 GPU 硬件信息 ──
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap",
@@ -40,9 +58,10 @@ def detect_gpu() -> dict:
     except Exception:
         pass
 
-    # --- CuPy detection ---
+    # ── 尝试导入 CuPy（GPU 加速库） ──
     try:
         import cupy as cp
+        # 执行一次简单运算验证 CuPy 真正可用
         _test = cp.arange(10, dtype=cp.float64)
         _ = cp.cumsum(_test)
         info["cupy_available"] = True
@@ -56,16 +75,22 @@ def detect_gpu() -> dict:
 
 
 def gpu() -> dict:
-    """Return cached GPU info (call detect_gpu first)."""
+    """返回缓存的 GPU 信息（若未检测则先执行检测）。"""
     return _gpu_info or detect_gpu()
 
 
 def xp():
-    """Return cupy if CUDA is available, else numpy."""
+    """返回数组计算模块：CuPy 可用时返回 cupy，否则返回 numpy。
+
+    用法：
+        from utils.gpu import xp
+        arr = xp().array([1, 2, 3])  # 自动选择 CPU 或 GPU
+    """
     return gpu()["xp"]
 
 
 def print_gpu_info(info: dict) -> None:
+    """格式化打印 GPU 检测信息。"""
     print(f"GPU: {info['gpu_name']}")
     print(f"  Memory:      {info['memory_mb']} MiB")
     print(f"  Compute Cap: {info['compute_cap']}")
