@@ -281,7 +281,6 @@ def generate_grid_signals_batch(
 # ══════════════════════════════════════════════════════════════════
 
 def scan_ma_strategy(close: pd.Series) -> pd.DataFrame:
-    print("  MA parameter scan…")
     return indicator_and_scan(
         close, "MA", compute_ma_indicators, "ma_window",
         windows=[20, 50, 75, 100, 150, 200],

@@ -41,14 +41,16 @@ def generate_switch_signals(
     flat_wait_days: int = 8,
     switch_deviation_m1: float = 0.03,
     switch_deviation_m2: float = 0.01,
+    switch_trailing_stop: float = 0.05,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Generate signals for MA Switch Strategy.
 
     Two modes:
-    - Grid mode (default): mean-reversion grid entries below MA baseline.
+    - Grid mode: mean-reversion grid entries below MA baseline.
     - Switch mode (activated after flat_wait_days flat bars when
       close > ma_base AND dev_pct > switch_deviation_m1): MA crossover
-      trend-following. Switch mode deactivates when dev_pct < switch_deviation_m2.
+      entry with trailing-stop exit. Switch deactivates when
+      dev_pct < switch_deviation_m2.
     """
     n = len(close)
     entries = np.zeros(n, dtype=bool)
@@ -63,6 +65,7 @@ def generate_switch_signals(
     ending_position = 0.0
     switch_mode_active = False
     flat_days = 0
+    peak_close = 0.0
 
     for i in range(n):
         dp = dev_pct[i]
@@ -77,6 +80,10 @@ def generate_switch_signals(
                     or np.isnan(mb) or np.isnan(fma) or np.isnan(sma))
         if nan_vars or mb <= 0 or cl <= 0:
             continue
+
+        # update peak for trailing stop
+        if in_position and switch_mode_active:
+            peak_close = max(peak_close, cl)
 
         if in_position:
             flat_days = 0
@@ -95,7 +102,7 @@ def generate_switch_signals(
         )
         dynamic_grid_step = max(dynamic_grid_step, base_grid_pct * 0.3)
 
-        # switch mode activation
+        # switch mode activation: only when grid is idle (no position)
         if (not switch_mode_active and not in_position
                 and flat_days >= flat_wait_days
                 and cl > mb and dp > switch_deviation_m1):
@@ -108,23 +115,25 @@ def generate_switch_signals(
                 continue
             if cl <= mb or dp <= switch_deviation_m1:
                 continue
-            if fma > sma:
-                if not in_position:
-                    full_size = float(np.nextafter(1.0, 0.0))
-                    entries[i] = True
-                    sizes[i] = full_size
-                    in_position = True
-                    entry_bar = i
-                    entry_level = 1
-                    entry_grid_step = max(base_grid_pct, 1e-9)
-                    flat_days = 0
+            if fma > sma and not in_position:
+                # entry on MA crossover (uptrend confirmed)
+                full_size = float(np.nextafter(1.0, 0.0))
+                entries[i] = True
+                sizes[i] = full_size
+                in_position = True
+                entry_bar = i
+                entry_level = 1
+                entry_grid_step = max(base_grid_pct, 1e-9)
+                flat_days = 0
+                peak_close = cl
                 continue
-            if fma < sma:
-                if in_position:
+            if in_position:
+                # exit on trailing stop from peak
+                if cl <= peak_close * (1.0 - switch_trailing_stop):
                     exits[i] = True
                     in_position = False
                     cooldown = cooldown_days
-                continue
+                    peak_close = 0.0
             continue
 
         # grid mode
@@ -188,6 +197,7 @@ extern "C" __global__ void switch_signals_kernel(
     const int* flat_wait_days,
     const double* switch_deviation_m1,
     const double* switch_deviation_m2,
+    const double* switch_trailing_stop,
     bool* entries,
     bool* exits,
     double* sizes,
@@ -211,6 +221,7 @@ extern "C" __global__ void switch_signals_kernel(
     int fw = flat_wait_days[combo_idx];
     double sw_m1 = switch_deviation_m1[combo_idx];
     double sw_m2 = switch_deviation_m2[combo_idx];
+    double sw_ts = switch_trailing_stop[combo_idx];
     int fi = fast_ma_idx[combo_idx];
     int si = slow_ma_idx[combo_idx];
 
@@ -221,6 +232,7 @@ extern "C" __global__ void switch_signals_kernel(
     int cooldown = 0;
     bool switch_mode_active = false;
     int flat_days = 0;
+    double peak_close = 0.0;
 
     for (int i = 0; i < n_bars; i++) {
         double cl = close[i];
@@ -238,6 +250,10 @@ extern "C" __global__ void switch_signals_kernel(
             exits[combo_idx * n_bars + i] = false;
             sizes[combo_idx * n_bars + i] = 0.0;
             continue;
+        }
+
+        if (in_position && switch_mode_active) {
+            peak_close = fmax(peak_close, cl);
         }
 
         if (in_position) {
@@ -273,31 +289,28 @@ extern "C" __global__ void switch_signals_kernel(
                 sizes[combo_idx * n_bars + i] = 0.0;
                 continue;
             }
-            if (fma > sma) {
-                if (!in_position) {
-                    entries[combo_idx * n_bars + i] = true;
-                    sizes[combo_idx * n_bars + i] = 0.9999999999999999;
-                    in_position = true;
-                    entry_bar = i;
-                    entry_level = 1;
-                    entry_grid_step = fmax(bgp, 1e-9);
-                    flat_days = 0;
-                }
-                exits[combo_idx * n_bars + i] = false;
+            if (fma > sma && !in_position) {
+                entries[combo_idx * n_bars + i] = true;
+                sizes[combo_idx * n_bars + i] = 0.9999999999999999;
+                in_position = true;
+                entry_bar = i;
+                entry_level = 1;
+                entry_grid_step = fmax(bgp, 1e-9);
+                flat_days = 0;
+                peak_close = cl;
                 continue;
             }
-            if (fma < sma) {
-                if (in_position) {
+            if (in_position) {
+                if (cl <= peak_close * (1.0 - sw_ts)) {
                     exits[combo_idx * n_bars + i] = true;
                     in_position = false;
                     cooldown = cooldown_days;
+                    peak_close = 0.0;
+                } else {
+                    exits[combo_idx * n_bars + i] = false;
                 }
-                entries[combo_idx * n_bars + i] = false;
-                sizes[combo_idx * n_bars + i] = 0.0;
-                continue;
             }
             entries[combo_idx * n_bars + i] = false;
-            exits[combo_idx * n_bars + i] = false;
             sizes[combo_idx * n_bars + i] = 0.0;
             continue;
         }
@@ -372,6 +385,7 @@ def generate_switch_signals_batch(
     flat_wait_days_arr: np.ndarray,
     switch_deviation_m1_arr: np.ndarray,
     switch_deviation_m2_arr: np.ndarray,
+    switch_trailing_stop_arr: np.ndarray,
     max_grid_levels: int = 3,
     max_holding_days: int = 30,
     cooldown_days: int = 1,
@@ -408,6 +422,7 @@ def generate_switch_signals_batch(
     fw_d = _pad_i32(flat_wait_days_arr)
     m1_d = _pad_f64(switch_deviation_m1_arr)
     m2_d = _pad_f64(switch_deviation_m2_arr)
+    tr_d = _pad_f64(switch_trailing_stop_arr)
     fi_d = _pad_i32(fast_ma_idx)
     si_d = _pad_i32(slow_ma_idx)
 
@@ -427,7 +442,7 @@ def generate_switch_signals_batch(
         (grid_size,), (block_size,),
         (
             close_d, dev_d, trend_d, vol_d, mb_d, ma_d, fi_d, si_d,
-            bgp_d, vs_d, ts_d, tpg_d, slg_d, fw_d, m1_d, m2_d,
+            bgp_d, vs_d, ts_d, tpg_d, slg_d, fw_d, m1_d, m2_d, tr_d,
             entries_d, exits_d, sizes_d,
             n_bars, n_combos, max_grid_levels, max_holding_days, cooldown_days,
             min_signal_strength, position_size, position_sizing_coef,
@@ -525,126 +540,32 @@ def scan_switch_strategy(close: pd.Series) -> pd.DataFrame:
 # Two-stage scan: grid params first, then switch params
 # ══════════════════════════════════════════════════════════════════
 
-_GRID_PARAMS = dict(
-    windows=[20, 50, 75, 100, 150, 200],
-    grid_pcts=[0.006, 0.008, 0.01, 0.012, 0.015, 0.018, 0.02],
-    vol_scales=[0.5, 1.0, 1.5, 2.0, 3.0],
-    trend_sens=[3.0, 6.0, 9.0, 12.0, 15.0],
-    tpg_values=[0.5, 0.7, 0.85, 1.0],
-    slg_values=[1.0, 1.3, 1.6, 2.0, 2.5],
-)
-
 _SWITCH_PARAMS = dict(
     flat_wait_days_vals=[5, 8, 15],
     switch_m1_vals=[0.02, 0.03, 0.05],
     switch_m2_vals=[0.005, 0.01, 0.02],
+    switch_trailing_stop_vals=[0.02, 0.03, 0.05, 0.07, 0.10],
     switch_fast_vals=[5, 20],
     switch_slow_vals=[10, 60],
 )
 
 
 def scan_switch_two_stage(close: pd.Series) -> pd.DataFrame:
-    """Two-stage scan: optimize grid params (switch disabled), then switch params.
+    """Two-stage scan using MA Grid's optimal params, then optimize switch logic.
 
-    Stage 1: Grid-only with switch mode disabled (flat_wait_days=∞).
-    Stage 2: Fix best grid params, optimize switch parameters.
+    Stage 1: Run MA Grid scan directly — reuses the same optimized grid.
+    Stage 2: Fix best MA Grid params, scan switch entry/exit conditions.
     """
-    use_gpu = gpu()["cupy_available"]
-    all_ma_windows = sorted(set(_SWITCH_PARAMS["switch_fast_vals"]
-                                + _SWITCH_PARAMS["switch_slow_vals"]))
-    ma_to_idx = {w: i for i, w in enumerate(all_ma_windows)}
+    from .ma_grid import scan_ma_strategy
 
-    # ── Stage 1: grid params, switch disabled ──
-    print("  [Switch Stage 1] Optimizing grid params (switch disabled)…")
+    # ── Stage 1: reuse MA Grid scan results ──
+    print("  [Switch Stage 1] Reusing MA Grid optimal params…")
+    ma_results = scan_ma_strategy(close)
 
-    grid_combos = list(product(
-        _GRID_PARAMS["grid_pcts"], _GRID_PARAMS["vol_scales"],
-        _GRID_PARAMS["trend_sens"], _GRID_PARAMS["tpg_values"],
-        _GRID_PARAMS["slg_values"],
-    ))
-    n_grid = len(grid_combos)
-    fw_disabled = np.full(n_grid, 999999, dtype=np.int32)
-    m1_disabled = np.full(n_grid, 999.0)
-    m2_disabled = np.full(n_grid, 0.0)
-    fi_disabled = np.full(n_grid, 0, dtype=np.int32)
-    si_disabled = np.full(n_grid, 1, dtype=np.int32)
-
-    stage1_results = []
-
-    for w in _GRID_PARAMS["windows"]:
-        n_bars = len(close)
-        if w > n_bars - 5:
-            continue
-
-        indicators = compute_ma_switch_indicators(close, w, ma_windows=all_ma_windows)
-        close_arr = close.values
-        ma_all = np.array([indicators[f"MA{mw}"].values for mw in all_ma_windows])
-
-        bgp_a = np.array([c[0] for c in grid_combos])
-        vs_a = np.array([c[1] for c in grid_combos])
-        ts_a = np.array([c[2] for c in grid_combos])
-        tpg_a = np.array([c[3] for c in grid_combos])
-        slg_a = np.array([c[4] for c in grid_combos])
-
-        if use_gpu:
-            entries_b, exits_b, sizes_b = generate_switch_signals_batch(
-                close_arr,
-                indicators["MADevPct"].values,
-                indicators["MADevTrend"].values,
-                indicators["RollingVolPct"].values,
-                indicators["MABase"].values,
-                ma_all, fi_disabled, si_disabled,
-                bgp_a, vs_a, ts_a, tpg_a, slg_a,
-                fw_disabled, m1_disabled, m2_disabled,
-                position_size=0.5, position_sizing_coef=30.0,
-            )
-            bt = run_backtest_batch(close_arr, entries_b, exits_b, sizes_b,
-                                    n_combos=n_grid)
-            for idx, (bgp, vs, ts, tpg, slg) in enumerate(grid_combos):
-                if int(bt[idx][4]) == 0:
-                    continue
-                stage1_results.append({
-                    "ma_window": w,
-                    "base_grid_pct": bgp, "volatility_scale": vs,
-                    "trend_sensitivity": ts, "take_profit_grid": tpg,
-                    "stop_loss_grid": slg,
-                    "total_return": bt[idx][0],
-                    "sharpe_ratio": bt[idx][1],
-                })
-        else:
-            for idx, (bgp, vs, ts, tpg, slg) in enumerate(grid_combos):
-                entries, exits, sizes = generate_switch_signals(
-                    close_arr,
-                    indicators["MADevPct"].values,
-                    indicators["MADevTrend"].values,
-                    indicators["RollingVolPct"].values,
-                    indicators["MABase"].values,
-                    indicators[f"MA{all_ma_windows[0]}"].values,
-                    indicators[f"MA{all_ma_windows[1]}"].values,
-                    base_grid_pct=bgp, volatility_scale=vs,
-                    trend_sensitivity=ts, take_profit_grid=tpg,
-                    stop_loss_grid=slg,
-                    flat_wait_days=999999,
-                    switch_deviation_m1=999.0, switch_deviation_m2=0.0,
-                    position_size=0.5, position_sizing_coef=30.0,
-                )
-                if entries.sum() == 0:
-                    continue
-                m = run_backtest(close, entries, exits, sizes)
-                stage1_results.append({
-                    "ma_window": w,
-                    "base_grid_pct": bgp, "volatility_scale": vs,
-                    "trend_sensitivity": ts, "take_profit_grid": tpg,
-                    "stop_loss_grid": slg,
-                    "total_return": m["total_return"],
-                    "sharpe_ratio": m["sharpe_ratio"],
-                })
-
-    if not stage1_results:
+    if ma_results.empty:
         return pd.DataFrame()
 
-    df1 = pd.DataFrame(stage1_results)
-    best_grid = df1.nlargest(1, "total_return").iloc[0]
+    best_grid = ma_results.nlargest(1, "total_return").iloc[0]
     best_w = int(best_grid["ma_window"])
     best_bgp = best_grid["base_grid_pct"]
     best_vs = best_grid["volatility_scale"]
@@ -652,24 +573,30 @@ def scan_switch_two_stage(close: pd.Series) -> pd.DataFrame:
     best_tpg = best_grid["take_profit_grid"]
     best_slg = best_grid["stop_loss_grid"]
 
-    print(f"  [Switch Stage 1] Best grid: w={best_w} bgp={best_bgp:.4f} "
+    print(f"  [Switch Stage 1] MA Grid best: w={best_w} bgp={best_bgp:.4f} "
           f"vs={best_vs:.1f} ts={best_ts:.0f} tpg={best_tpg:.2f} slg={best_slg:.1f} "
           f"ret={best_grid['total_return']:.1%}")
 
     # ── Stage 2: fix grid, optimize switch ──
     print("  [Switch Stage 2] Optimizing switch params (grid fixed)…")
 
+    use_gpu = gpu()["cupy_available"]
+    all_ma_windows = sorted(set(_SWITCH_PARAMS["switch_fast_vals"]
+                                + _SWITCH_PARAMS["switch_slow_vals"]))
+    ma_to_idx = {w: i for i, w in enumerate(all_ma_windows)}
+
     switch_combos = []
-    for fw, sw_m1, sw_m2, sw_fast, sw_slow in product(
+    for fw, sw_m1, sw_m2, sw_tr, sw_fast, sw_slow in product(
         _SWITCH_PARAMS["flat_wait_days_vals"],
         _SWITCH_PARAMS["switch_m1_vals"],
         _SWITCH_PARAMS["switch_m2_vals"],
+        _SWITCH_PARAMS["switch_trailing_stop_vals"],
         _SWITCH_PARAMS["switch_fast_vals"],
         _SWITCH_PARAMS["switch_slow_vals"],
     ):
         if sw_m2 >= sw_m1 or sw_fast >= sw_slow:
             continue
-        switch_combos.append((fw, sw_m1, sw_m2, sw_fast, sw_slow))
+        switch_combos.append((fw, sw_m1, sw_m2, sw_tr, sw_fast, sw_slow))
 
     n_switch = len(switch_combos)
     indicators = compute_ma_switch_indicators(close, best_w, ma_windows=all_ma_windows)
@@ -684,8 +611,9 @@ def scan_switch_two_stage(close: pd.Series) -> pd.DataFrame:
     fw_a = np.array([c[0] for c in switch_combos], dtype=np.int32)
     m1_a = np.array([c[1] for c in switch_combos])
     m2_a = np.array([c[2] for c in switch_combos])
-    fi_a = np.array([ma_to_idx[c[3]] for c in switch_combos], dtype=np.int32)
-    si_a = np.array([ma_to_idx[c[4]] for c in switch_combos], dtype=np.int32)
+    tr_a = np.array([c[3] for c in switch_combos])
+    fi_a = np.array([ma_to_idx[c[4]] for c in switch_combos], dtype=np.int32)
+    si_a = np.array([ma_to_idx[c[5]] for c in switch_combos], dtype=np.int32)
 
     results = []
 
@@ -698,12 +626,12 @@ def scan_switch_two_stage(close: pd.Series) -> pd.DataFrame:
             indicators["MABase"].values,
             ma_all, fi_a, si_a,
             bgp_a, vs_a, ts_a, tpg_a, slg_a,
-            fw_a, m1_a, m2_a,
+            fw_a, m1_a, m2_a, tr_a,
             position_size=0.5, position_sizing_coef=30.0,
         )
         bt = run_backtest_batch(close_arr, entries_b, exits_b, sizes_b,
                                 n_combos=n_switch)
-        for idx, (fw, sw_m1, sw_m2, sw_fast, sw_slow) in enumerate(switch_combos):
+        for idx, (fw, sw_m1, sw_m2, sw_tr, sw_fast, sw_slow) in enumerate(switch_combos):
             if int(bt[idx][4]) == 0:
                 continue
             results.append({
@@ -716,10 +644,11 @@ def scan_switch_two_stage(close: pd.Series) -> pd.DataFrame:
                 "stop_loss_grid": best_slg,
                 "flat_wait_days": fw, "switch_deviation_m1": sw_m1,
                 "switch_deviation_m2": sw_m2,
+                "switch_trailing_stop": sw_tr,
                 "switch_fast_ma": sw_fast, "switch_slow_ma": sw_slow,
             })
     else:
-        for (fw, sw_m1, sw_m2, sw_fast, sw_slow) in switch_combos:
+        for (fw, sw_m1, sw_m2, sw_tr, sw_fast, sw_slow) in switch_combos:
             entries, exits, sizes = generate_switch_signals(
                 close_arr,
                 indicators["MADevPct"].values,
@@ -733,6 +662,7 @@ def scan_switch_two_stage(close: pd.Series) -> pd.DataFrame:
                 stop_loss_grid=best_slg,
                 flat_wait_days=fw, switch_deviation_m1=sw_m1,
                 switch_deviation_m2=sw_m2,
+                switch_trailing_stop=sw_tr,
                 position_size=0.5, position_sizing_coef=30.0,
             )
             if entries.sum() == 0:

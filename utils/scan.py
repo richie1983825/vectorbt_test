@@ -88,8 +88,7 @@ def indicator_and_scan(
                 results.append(metrics)
 
                 count += 1
-                if count % 200 == 0:
-                    print(f"  [{label}] {count}/{total}")
+                # progress silent in batch mode
         else:
             # --- CPU fallback ---
             for bgp, vs, ts, tpg, slg in param_combos:
@@ -113,8 +112,7 @@ def indicator_and_scan(
                 results.append(metrics)
 
                 count += 1
-                if count % 200 == 0:
-                    print(f"  [{label}] {count}/{total}")
+                # progress silent in batch mode
 
     return pd.DataFrame(results)
 

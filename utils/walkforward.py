@@ -160,6 +160,10 @@ def run_walk_forward(
         test_offset = w.test_start - w.warmup_start
         test_metrics = eval_fn(close_warmup_all, test_offset, best_params)
 
+        test_close = close.iloc[w.test_start:w.test_end]
+        bh_return = ((test_close.iloc[-1] - test_close.iloc[0]) / test_close.iloc[0]
+                     if len(test_close) >= 2 else 0.0)
+
         row = {
             "strategy": strategy_name,
             "train_years": w.train_years,
@@ -168,20 +172,23 @@ def run_walk_forward(
                 f"{close_train_only.index[-1].date()}"
             ),
             "test_period": (
-                f"{close.iloc[w.test_start:w.test_end].index[0].date()}→"
-                f"{close.iloc[w.test_start:w.test_end].index[-1].date()}"
+                f"{test_close.index[0].date()}→"
+                f"{test_close.index[-1].date()}"
             ),
             "train_return": best["total_return"],
             "train_sharpe": best["sharpe_ratio"],
             "train_max_dd": best["max_drawdown"],
+            "buy_hold_return": bh_return,
             **test_metrics,
             **best_params,
         }
         rows.append(row)
 
+        excess = test_metrics.get("test_return", 0) - bh_return
         print(f"  [{strategy_name}] train={w.train_label} test={w.test_label}  "
               f"train_ret={best['total_return']:.1%}  "
               f"test_ret={test_metrics.get('test_return', 0):.1%}  "
+              f"BH={bh_return:.1%}  α={excess:+.1%}  "
               f"trades={test_metrics.get('num_trades', 0)}")
 
     return pd.DataFrame(rows)
@@ -201,16 +208,23 @@ def print_walk_forward_summary(results: pd.DataFrame, strategy_name: str) -> Non
     for n, grp in results.groupby("train_years"):
         windows_n = len(grp)
         pos_test = (grp["test_return"] > 0).sum()
+        pos_excess = (grp["test_return"] > grp["buy_hold_return"]).sum()
         avg_test = grp["test_return"].mean()
-        avg_train = grp["train_return"].mean()
+        avg_bh = grp["buy_hold_return"].mean()
+        avg_excess = (grp["test_return"] - grp["buy_hold_return"]).mean()
         print(f"\n  Training = {n} year(s)  |  {windows_n} windows")
-        print(f"    Avg train return: {avg_train:+.1%}")
         print(f"    Avg test return:  {avg_test:+.1%}")
-        print(f"    Test win rate:    {pos_test}/{windows_n} ({pos_test/windows_n:.0%})")
+        print(f"    Avg buy & hold:   {avg_bh:+.1%}")
+        print(f"    Avg excess (α):   {avg_excess:+.1%}")
+        print(f"    Beat BH:          {pos_excess}/{windows_n} ({pos_excess/windows_n:.0%})")
         print(f"    Avg test Sharpe:  {grp['test_sharpe'].mean():.3f}")
         print(f"    Test returns:     {'  '.join(f'{v:+.1%}' for v in grp['test_return'])}")
 
+    overall_excess = (results["test_return"] - results["buy_hold_return"]).mean()
+    beat_bh = (results["test_return"] > results["buy_hold_return"]).sum()
     print(f"\n  Overall ({len(results)} windows):")
     print(f"    Mean test return:  {results['test_return'].mean():+.1%}")
+    print(f"    Mean buy & hold:   {results['buy_hold_return'].mean():+.1%}")
+    print(f"    Mean excess (α):   {overall_excess:+.1%}")
+    print(f"    Beat BH:           {beat_bh}/{len(results)} ({beat_bh/len(results):.0%})")
     print(f"    Mean test Sharpe:  {results['test_sharpe'].mean():.3f}")
-    print(f"    Positive windows:  {(results['test_return'] > 0).sum()}/{len(results)}")
