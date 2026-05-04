@@ -6,7 +6,7 @@
 import pandas as pd
 
 # 默认数据路径：512890.SH（中证红利 ETF）后复权
-DATA_PATH = "data/512890.SH_hfq.parquet"
+DATA_PATH = "data/1d/512890.SH_hfq.parquet"
 
 
 def load_data(path: str = DATA_PATH) -> pd.DataFrame:

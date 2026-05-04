@@ -276,3 +276,51 @@ def compute_polyfit_switch_indicators(
         + [f"MA{mw}" for mw in ma_windows]
     )
     return df.dropna(subset=feature_cols)
+
+
+def compute_polyfit_base_only(
+    close: pd.Series,
+    fit_window_days: int = 252,
+    ma_windows: list[int] | None = None,
+) -> pd.DataFrame:
+    """只计算 Polyfit 基线 + 偏离度 + MA（不依赖 trend/vol 窗口的部分）。
+
+    Polyfit 基线是扫描中最耗时的部分（CPU Python 循环，O(n×window)），
+    但它只依赖 fit_window_days（固定 252），与 trend_window_days 和
+    vol_window_days 无关。将此部分提取出来单独计算，在扫描中复用，避免重复计算。
+
+    Returns:
+        DataFrame with columns: PolyBasePred, PolyDevPct, MA{5,10,20,60}
+    """
+    if ma_windows is None:
+        ma_windows = [5, 10, 20, 60]
+    close_arr = close.values.astype(np.float64)
+    pred, _slope = compute_polyfit_baseline(close_arr, fit_window_days)
+
+    df = pd.DataFrame(index=close.index)
+    df["PolyBasePred"] = pred
+    df["PolyDevPct"] = close_arr / pred - 1.0
+    for mw in ma_windows:
+        df[f"MA{mw}"] = close.rolling(mw, min_periods=mw).mean()
+
+    feature_cols = ["PolyBasePred", "PolyDevPct"] + [f"MA{mw}" for mw in ma_windows]
+    return df.dropna(subset=feature_cols)
+
+
+def add_trend_vol_indicators(
+    base_df: pd.DataFrame,
+    close: pd.Series,
+    trend_window_days: int = 20,
+    vol_window_days: int = 20,
+) -> pd.DataFrame:
+    """在已有基线指标上追加 PolyDevTrend 和 RollingVolPct。
+
+    这两个指标依赖 trend_window_days 和 vol_window_days，
+    在参数扫描中这两个参数会变化，而基线不变。
+    """
+    dev_pct = base_df["PolyDevPct"]
+    df = base_df.copy()
+    df["PolyDevTrend"] = compute_polyfit_deviation_trend(dev_pct, trend_window_days)
+    df["RollingVolPct"] = compute_polyfit_volatility(close, vol_window_days)
+    feature_cols = ["PolyDevTrend", "RollingVolPct"]
+    return df.dropna(subset=feature_cols)

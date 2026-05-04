@@ -58,7 +58,7 @@ def _make_eval_fn(open_):
         cl_test = close_warmup_all.loc[ind_test.index]
         op_test = open_.reindex(ind_test.index) if open_ is not None else None
 
-        e, x, s = generate_polyfit_switch_signals(
+        e, x, s, _modes = generate_polyfit_switch_signals(
             cl_test.values,
             ind_test["PolyDevPct"].values,
             ind_test["PolyDevTrend"].values,

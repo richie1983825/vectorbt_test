@@ -25,18 +25,19 @@ class WFWWindow:
     """Walk-Forward 窗口定义。
 
     每个窗口包含：
-      - warmup:  训练期之前的一整年数据（用于指标预热，不参与信号生成）
-      - train:   N 个完整年的训练数据
-      - test:    紧随训练期之后的一整年测试数据
+      - warmup:  训练期之前的数据（用于指标预热，不参与信号生成）
+      - train:   N 个完整年（或月）的训练数据
+      - test:    紧随训练期之后的测试数据
     """
-    train_years: int            # 训练年数
+    train_years: int            # 训练年数（月度模式时为 0）
     warmup_start: int           # 预热起始 iloc
     train_start: int            # 训练起始 iloc
     test_start: int             # 测试起始 iloc
     test_end: int               # 测试结束 iloc（不包含）
-    warmup_label: str           # 预热年份标签
-    train_label: str            # 训练年份标签
-    test_label: str             # 测试年份标签
+    warmup_label: str           # 预热标签
+    train_label: str            # 训练标签
+    test_label: str             # 测试标签
+    train_months: int = 0       # 训练月数（月度模式，0=使用年模式）
 
 
 def _year_boundaries(index: pd.DatetimeIndex) -> dict[int, tuple[int, int]]:
@@ -63,6 +64,27 @@ def _is_full_year(index: pd.DatetimeIndex, year: int) -> bool:
     if len(dates) == 0:
         return False
     return dates[0].day <= 10 and dates[-1].month == 12 and dates[-1].day >= 20
+
+
+def _month_boundaries(index: pd.DatetimeIndex) -> list[tuple[str, int, int]]:
+    """返回 [(月份标签, 起始iloc, 结束iloc_不包含), ...] 列表。
+
+    通过遍历日期列查找年月变化点来生成月份边界，避免依赖
+    groupby 内部实现（不同 pandas 版本兼容性问题）。
+    """
+    boundaries = []
+    prev_ym = None
+    start_idx = 0
+    for i, dt in enumerate(index):
+        ym = (dt.year, dt.month)
+        if ym != prev_ym:
+            if prev_ym is not None:
+                boundaries.append((f"{prev_ym[0]}-{prev_ym[1]:02d}", start_idx, i))
+            start_idx = i
+            prev_ym = ym
+    if prev_ym is not None:
+        boundaries.append((f"{prev_ym[0]}-{prev_ym[1]:02d}", start_idx, len(index)))
+    return boundaries
 
 
 def generate_windows(
@@ -130,6 +152,61 @@ def generate_windows(
                 train_label=f"{t_start}-{t_end - 1}" if n > 1 else str(t_start),
                 test_label=f"{test_yr}",
             ))
+
+    return windows
+
+
+def generate_monthly_windows(
+    index: pd.DatetimeIndex,
+    train_months: int = 12,
+    test_months: int = 12,
+    step_months: int = 1,
+    warmup_months: int = 12,
+) -> list[WFWWindow]:
+    """按日历月生成 Walk-Forward 窗口。
+
+    训练期和测试期均以日历月为粒度，支持逐月滑动。
+    预热期使用训练期之前的 warmup_months 个月数据。
+
+    Args:
+        index:         数据的 DatetimeIndex
+        train_months:  训练窗口的日历月数
+        test_months:   测试窗口的日历月数
+        step_months:   窗口滑动步长（月）
+        warmup_months: 预热窗口的日历月数
+
+    Returns:
+        WFWWindow 列表（train_months 字段有效，train_years=0）
+    """
+    month_bounds = _month_boundaries(index)
+    n_months = len(month_bounds)
+
+    min_months = warmup_months + train_months + test_months
+    if n_months < min_months:
+        return []
+
+    windows = []
+    first_train_idx = warmup_months
+    last_train_idx = n_months - train_months - test_months
+
+    for i in range(first_train_idx, last_train_idx + 1, step_months):
+        warmup_idx = i - warmup_months
+        train_start = month_bounds[i][1]
+        test_start = month_bounds[i + train_months][1]
+        test_end = month_bounds[i + train_months + test_months - 1][2]
+        warmup_start = month_bounds[max(0, warmup_idx)][1]
+
+        windows.append(WFWWindow(
+            train_years=0,  # 月度模式
+            warmup_start=warmup_start,
+            train_start=train_start,
+            test_start=test_start,
+            test_end=test_end,
+            warmup_label=month_bounds[max(0, warmup_idx)][0],
+            train_label=f"{month_bounds[i][0]}→{month_bounds[i+train_months-1][0]}",
+            test_label=f"{month_bounds[i+train_months][0]}→{month_bounds[i+train_months+test_months-1][0]}",
+            train_months=train_months,
+        ))
 
     return windows
 
@@ -228,6 +305,107 @@ def run_walk_forward(
               f"test_ret={test_metrics.get('test_return', 0):.1%}  "
               f"BH={bh_return:.1%}  α={excess:+.1%}  "
               f"trades={test_metrics.get('num_trades', 0)}")
+
+    return pd.DataFrame(rows)
+
+
+def run_walk_forward_multi_selector(
+    close: pd.Series,
+    strategy_name: str,
+    scan_fn: Callable[[pd.Series], pd.DataFrame],
+    eval_fn: Callable[[pd.Series, int, dict], dict],
+    param_keys: list[str],
+    selectors: dict[str, Callable[[pd.DataFrame], pd.Series]],
+    train_months: int = 12,
+    test_months: int = 12,
+    step_months: int = 1,
+    warmup_months: int = 12,
+    min_train_bars: int = 200,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """多评分方法 Walk-Forward 分析（月度窗口）。
+
+    对每个窗口只运行一次参数扫描，然后用多种评分方法选取最优参数，
+    分别评估测试期表现。避免了重复扫描的计算开销。
+
+    Args:
+        close:          完整收盘价序列
+        strategy_name:  策略标签
+        scan_fn:        参数扫描函数: (close_train_only) → DataFrame
+        eval_fn:        测试评估函数: (close_warmup_all, test_offset, best_params) → dict
+        param_keys:     要保存的参数列名
+        selectors:      {评分方法名: 选择函数} 字典
+        train_months:   训练窗口月数
+        test_months:    测试窗口月数（默认 12）
+        step_months:    窗口滑动步长
+        warmup_months:  预热月数
+        min_train_bars: 训练期最少 bar 数（不足则跳过窗口）
+        verbose:        是否打印进度
+
+    Returns:
+        DataFrame，每行包含 selector 列区分不同评分方法的结果。
+    """
+    windows = generate_monthly_windows(
+        close.index, train_months, test_months, step_months, warmup_months,
+    )
+
+    if verbose:
+        print(f"  [{strategy_name}] train={train_months}m test={test_months}m → "
+              f"{len(windows)} windows × {len(selectors)} selectors")
+
+    rows = []
+    for wi, w in enumerate(windows):
+        # 训练数据量检查
+        n_train_bars = w.test_start - w.train_start
+        if n_train_bars < min_train_bars:
+            continue
+
+        close_warmup_train = close.iloc[w.warmup_start:w.test_start]
+        close_train_only = close.iloc[w.train_start:w.test_start]
+
+        # 一次扫描，多方法评估
+        scan_results = scan_fn(close_train_only)
+        if scan_results.empty:
+            continue
+
+        close_warmup_all = close.iloc[w.warmup_start:w.test_end]
+        test_offset = w.test_start - w.warmup_start
+        test_close = close.iloc[w.test_start:w.test_end]
+        bh_return = ((test_close.iloc[-1] - test_close.iloc[0]) / test_close.iloc[0]
+                     if len(test_close) >= 2 else 0.0)
+
+        for sel_name, sel_fn in selectors.items():
+            try:
+                best = sel_fn(scan_results)
+            except Exception:
+                continue
+            best_params = _params_from_best(best, param_keys)
+            test_metrics = eval_fn(close_warmup_all, test_offset, best_params)
+
+            row = {
+                "strategy": strategy_name,
+                "train_months": train_months,
+                "selector": sel_name,
+                "train_period": (
+                    f"{close_train_only.index[0].date()}→"
+                    f"{close_train_only.index[-1].date()}"
+                ),
+                "test_period": (
+                    f"{test_close.index[0].date()}→"
+                    f"{test_close.index[-1].date()}"
+                ),
+                "n_train_bars": n_train_bars,
+                "train_return": best["total_return"],
+                "train_sharpe": best["sharpe_ratio"],
+                "train_max_dd": best["max_drawdown"],
+                "buy_hold_return": bh_return,
+                **test_metrics,
+                **best_params,
+            }
+            rows.append(row)
+
+        if verbose and (wi + 1) % 10 == 0:
+            print(f"    [{strategy_name}] {wi + 1}/{len(windows)} windows done")
 
     return pd.DataFrame(rows)
 
