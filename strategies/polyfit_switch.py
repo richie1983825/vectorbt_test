@@ -86,9 +86,10 @@ def generate_polyfit_switch_signals(
     cooldown = 0
 
     # Switch 状态
-    switch_active = False         # Switch 已激活（偏离度满足，等待金叉）
+    switch_active = False         # Switch 已激活（偏离度满足）
     switch_peak = 0.0             # 持仓期间最高价
-    cross_available = False       # 有可用的（未被使用过的）金叉
+    switch_ever_entered = False   # 是否曾经入场过（首次入场免金叉）
+    cross_available = False       # 有可用的金叉状态
     prev_fma = 0.0
     prev_sma = 0.0
 
@@ -105,10 +106,11 @@ def generate_polyfit_switch_signals(
             prev_fma, prev_sma = fma, sma
             continue
 
-        # 检测金叉（快线上穿慢线）
-        new_golden_cross = (fma > sma and prev_fma <= prev_sma)
-        if new_golden_cross:
-            cross_available = True  # 新鲜金叉可用
+        # 持续跟踪金叉/死叉（供 Switch 使用）
+        if fma > sma and prev_fma <= prev_sma:
+            cross_available = True   # 新金叉 → 可用
+        elif fma < sma and prev_fma >= prev_sma:
+            cross_available = False  # 死叉 → 作废
 
         # 动态网格步长
         vol_mult = 1.0 + volatility_scale * max(vp, 0.0)
@@ -147,21 +149,22 @@ def generate_polyfit_switch_signals(
                         entry_grid_step = dynamic_grid_step
                         entry_close_price = cl
 
-            # Switch 激活（趋势追踪，等待金叉入场）
+            # Switch 激活（趋势追踪，dp > m1 时激活）
             if position_mode == 0 and not switch_active and dp > switch_deviation_m1:
                 switch_active = True
-                cross_available = new_golden_cross  # 激活时若已有金叉则立即可用
 
-            # Switch 入场：激活中 + 有可用的金叉
-            if position_mode == 0 and switch_active and cross_available:
+            # Switch 入场：首次入场免金叉，之后需金叉
+            can_enter = switch_active and (cross_available or not switch_ever_entered)
+            if position_mode == 0 and can_enter:
                 entries[i] = True
-                sizes[i] = float(np.nextafter(1.0, 0.0))  # 接近全仓
+                sizes[i] = float(np.nextafter(1.0, 0.0))
                 entry_modes[i] = 2
                 position_mode = 2
                 entry_bar = i
                 entry_grid_step = max(base_grid_pct, 1e-9)
                 switch_peak = cl
-                cross_available = False  # 消耗此金叉
+                cross_available = False
+                switch_ever_entered = True
 
         # ── Grid 持仓状态 ──
         elif position_mode == 1:
@@ -171,29 +174,66 @@ def generate_polyfit_switch_signals(
                         if not np.isnan(entry_grid_step) else dynamic_grid_step)
             tp_threshold = entry_level * ref_step * take_profit_grid
             sl_threshold = entry_level * ref_step * stop_loss_grid
-            # TP: 偏离度恢复到 tp_threshold 以上（接近基线）, SL: 偏离度扩大超过 sl_threshold
-            if hold_limit or dp >= tp_threshold or dp <= -sl_threshold:
+            tp_trigger = dp >= tp_threshold
+            sl_trigger = dp <= -sl_threshold
+            if hold_limit or sl_trigger:
                 exits[i] = True
                 position_mode = 0
                 cooldown = cooldown_days
+            elif tp_trigger:
+                # 止盈时检查是否可转 Switch（不卖出，无缝切换）
+                if not switch_active and dp > switch_deviation_m1:
+                    switch_active = True
+                can_handover = switch_active and (cross_available or not switch_ever_entered)
+                if can_handover:
+                    position_mode = 2
+                    entry_bar = i
+                    entry_grid_step = max(base_grid_pct, 1e-9)
+                    switch_peak = cl
+                    cross_available = False
+                    switch_ever_entered = True
+                else:
+                    exits[i] = True
+                    position_mode = 0
+                    cooldown = cooldown_days
 
         # ── Switch 持仓状态 ──
         elif position_mode == 2:
-            switch_peak = max(switch_peak, cl)
-            trailing_exit = cl <= switch_peak * (1.0 - switch_trailing_stop)
-            deviation_exit = dp < switch_deviation_m2
-            if trailing_exit or deviation_exit:
-                exits[i] = True
-                position_mode = 0
-                switch_active = False
-                switch_peak = 0.0
-                cross_available = False  # 离场后必须等下一根金叉
-                cooldown = cooldown_days
+            # 价格跌破基线：立即检查是否转 Grid
+            if dp < 0:
+                signal_strength = abs(dp) / max(dynamic_grid_step, 1e-9)
+                entry_lvl = int(np.clip(np.floor(signal_strength), 1, max_grid_levels))
+                grid_entry_threshold = -entry_lvl * dynamic_grid_step
+                if dp <= grid_entry_threshold and signal_strength >= min_signal_strength:
+                    # Grid 条件满足 → 不卖出，直接切换为 Grid 持仓
+                    position_mode = 1
+                    entry_bar = i
+                    entry_level = entry_lvl
+                    entry_grid_step = dynamic_grid_step
+                    entry_close_price = cl
+                    switch_active = False
+                    switch_peak = 0.0
+                else:
+                    # Grid 条件不满足 → 清仓
+                    exits[i] = True
+                    position_mode = 0
+                    switch_active = False
+                    switch_peak = 0.0
+                    cooldown = cooldown_days
+            else:
+                switch_peak = max(switch_peak, cl)
+                trailing_exit = cl <= switch_peak * (1.0 - switch_trailing_stop)
+                deviation_exit = dp < switch_deviation_m2
+                if trailing_exit or deviation_exit:
+                    exits[i] = True
+                    position_mode = 0
+                    switch_active = False
+                    switch_peak = 0.0
+                    cooldown = cooldown_days
 
         # Switch 关闭条件（未持仓时，偏离度回落）
         if switch_active and position_mode != 2 and dp < switch_deviation_m2:
             switch_active = False
-            cross_available = False
 
         prev_fma, prev_sma = fma, sma
 
@@ -278,6 +318,7 @@ extern "C" __global__ void polyfit_switch_signals_kernel_v3(
     int cooldown = 0;
     bool switch_active = false;
     double switch_peak = 0.0;
+    bool switch_ever_entered = false;
     bool cross_available = false;
     double prev_fma = 0.0, prev_sma = 0.0;
 
@@ -301,9 +342,9 @@ extern "C" __global__ void polyfit_switch_signals_kernel_v3(
             continue;
         }
 
-        // 检测新金叉
-        bool new_cross = (fma > sma && prev_fma <= prev_sma);
-        if (new_cross) cross_available = true;
+        // 持续跟踪金叉/死叉
+        if (fma > sma && prev_fma <= prev_sma) cross_available = true;
+        if (fma < sma && prev_fma >= prev_sma) cross_available = false;
 
         if (cooldown > 0) cooldown--;
 
@@ -338,16 +379,17 @@ extern "C" __global__ void polyfit_switch_signals_kernel_v3(
             // Switch 激活
             if (position_mode == 0 && !switch_active && dp > sw_m1) {
                 switch_active = true;
-                cross_available = new_cross;
             }
-            // Switch 入场：激活 + 有可用的新鲜金叉
-            if (position_mode == 0 && switch_active && cross_available) {
+            // Switch 入场：首次免金叉，之后需金叉
+            bool can_enter_sw = switch_active && (cross_available || !switch_ever_entered);
+            if (position_mode == 0 && can_enter_sw) {
                 entries[combo_idx * n_bars + i] = true;
                 sizes[combo_idx * n_bars + i] = 0.9999999999999999;
                 position_mode = 2;
                 entry_bar = i; entry_grid_step = fmax(bgp, 1e-9);
                 switch_peak = cl;
                 cross_available = false;
+                switch_ever_entered = true;
             }
         }
 
@@ -359,33 +401,67 @@ extern "C" __global__ void polyfit_switch_signals_kernel_v3(
             if (entry_grid_step < 0.0 || isnan(entry_grid_step)) rs = dgs;
             double tp_threshold = entry_level * rs * tpg;
             double sl_threshold = entry_level * rs * slg;
-            // TP/SL 均以基线偏离度 dp 为锚
-            if (hl || dp >= tp_threshold || dp <= -sl_threshold) {
+            bool tp_trig = dp >= tp_threshold;
+            bool sl_trig = dp <= -sl_threshold;
+            if (hl || sl_trig) {
                 exits[combo_idx * n_bars + i] = true;
                 position_mode = 0;
                 cooldown = cd;
+            } else if (tp_trig) {
+                // 止盈时检查是否可转 Switch
+                if (!switch_active && dp > sw_m1) switch_active = true;
+                bool can_ho = switch_active && (cross_available || !switch_ever_entered);
+                if (can_ho) {
+                    position_mode = 2;
+                    entry_bar = i; entry_grid_step = fmax(bgp, 1e-9);
+                    switch_peak = cl;
+                    cross_available = false;
+                    switch_ever_entered = true;
+                } else {
+                    exits[combo_idx * n_bars + i] = true;
+                    position_mode = 0;
+                    cooldown = cd;
+                }
             }
         }
 
         // ── Switch 持仓 ──
         else if (position_mode == 2) {
-            switch_peak = fmax(switch_peak, cl);
-            bool trail_exit = cl <= switch_peak * (1.0 - sw_ts);
-            bool dev_exit = dp < sw_m2;
-            if (trail_exit || dev_exit) {
-                exits[combo_idx * n_bars + i] = true;
-                position_mode = 0;
-                switch_active = false;
-                switch_peak = 0.0;
-                cross_available = false;  // 离场后等新鲜金叉
-                cooldown = cd;
+            // 价格跌破基线：检查是否转 Grid
+            if (dp < 0.0) {
+                double sig = fabs(dp) / fmax(dgs, 1e-9);
+                int el = (int)floor(sig);
+                el = el < 1 ? 1 : (el > mgl ? mgl : el);
+                double eth = -(double)el * dgs;
+                if (dp <= eth && sig >= mss) {
+                    // Grid 条件满足 → 切换为 Grid 持仓，不卖出
+                    position_mode = 1;
+                    entry_bar = i; entry_level = el; entry_grid_step = dgs;
+                    entry_close_price = cl;
+                    switch_active = false; switch_peak = 0.0;
+                } else {
+                    // Grid 不满足 → 清仓
+                    exits[combo_idx * n_bars + i] = true;
+                    position_mode = 0;
+                    switch_active = false; switch_peak = 0.0;
+                    cooldown = cd;
+                }
+            } else {
+                switch_peak = fmax(switch_peak, cl);
+                bool trail_exit = cl <= switch_peak * (1.0 - sw_ts);
+                bool dev_exit = dp < sw_m2;
+                if (trail_exit || dev_exit) {
+                    exits[combo_idx * n_bars + i] = true;
+                    position_mode = 0;
+                    switch_active = false; switch_peak = 0.0;
+                    cooldown = cd;
+                }
             }
         }
 
         // Switch 关闭（未持仓时偏离回落）
         if (switch_active && position_mode != 2 && dp < sw_m2) {
             switch_active = false;
-            cross_available = false;
         }
 
         prev_fma = fma; prev_sma = sma;

@@ -362,7 +362,7 @@ def generate_polyfit_switch_report(
             row_heights=[0.45, 0.20, 0.15, 0.20],
             vertical_spacing=0.03,
             subplot_titles=(
-                f"{name} - K线 + Polyfit基线 + 买卖标记",
+                f"{name} - K线 + Polyfit基线",
                 "累积收益 (Full vs Grid-only vs BH)",
                 "持仓仓位",
                 "逐笔交易盈亏 (%)",
@@ -383,51 +383,6 @@ def generate_polyfit_switch_report(
                 x=idx, y=df_aligned["PolyBasePred"], mode="lines",
                 name="Polyfit基线", line=dict(color="#FF9800", width=1.5),
             ), row=1, col=1)
-        fp_vals = fill_price.reindex(idx).values
-        n = len(idx)
-
-        # ── 入场标记：放在成交日期（信号 bar + 1） ──
-        e_idx = np.where(entries)[0]
-        # Grid 入场
-        e_grid = [(i, idx[i+1], fp_vals[i]) for i in e_idx
-                  if entry_modes[i] == 1 and i+1 < n and not np.isnan(fp_vals[i])]
-        if e_grid:
-            fig_ov.add_trace(go.Scatter(
-                x=[x[1] for x in e_grid], y=[x[2] for x in e_grid], mode="markers",
-                name="Grid入场", marker=dict(symbol="triangle-up", size=8, color="#4CAF50"),
-                text=[f"Grid入场<br>日期: {x[1].date()}<br>成交价: {x[2]:.4f}" for x in e_grid],
-            ), row=1, col=1)
-        # Switch 入场
-        e_sw = [(i, idx[i+1], fp_vals[i]) for i in e_idx
-                if entry_modes[i] == 2 and i+1 < n and not np.isnan(fp_vals[i])]
-        if e_sw:
-            fig_ov.add_trace(go.Scatter(
-                x=[x[1] for x in e_sw], y=[x[2] for x in e_sw], mode="markers",
-                name="Switch入场", marker=dict(symbol="triangle-up", size=10, color="#2196F3"),
-                text=[f"Switch入场<br>日期: {x[1].date()}<br>成交价: {x[2]:.4f}" for x in e_sw],
-            ), row=1, col=1)
-
-        # ── 离场标记：放在成交日期，标注原因 ──
-        x_idx = np.where(exits)[0]
-        x_data = []
-        for j in x_idx:
-            if j+1 >= n or np.isnan(fp_vals[j]):
-                continue
-            fill_dt = idx[j+1]
-            info = exit_info_map.get(fill_dt)
-            if info is not None:
-                x_data.append((fill_dt, fp_vals[j], info))
-            else:
-                x_data.append((fill_dt, fp_vals[j], None))
-        if x_data:
-            fig_ov.add_trace(go.Scatter(
-                x=[d[0] for d in x_data], y=[d[1] for d in x_data], mode="markers",
-                name="离场", marker=dict(symbol="triangle-down", size=8, color="#F44336"),
-                text=[f"{d[2]['reason']}<br>日期: {d[0].date()}<br>成交价: {d[1]:.4f}<br>收益: {d[2]['return_pct']:+.2f}%"
-                      if d[2] else f"离场<br>日期: {d[0].date()}<br>成交价: {d[1]:.4f}"
-                      for d in x_data],
-            ), row=1, col=1)
-
         # Row 2: 累积收益
         bh_cum = close / close.iloc[0] - 1
         eq_f = pf.value() / pf.value().iloc[0] - 1
@@ -454,12 +409,25 @@ def generate_polyfit_switch_report(
             name="持仓",
         ), row=3, col=1)
 
-        # Row 4: 逐笔交易盈亏
+        # Row 4: 逐笔交易盈亏（含买卖明细）
         if trade_returns_pct:
             colors = ["#4CAF50" if r > 0 else "#F44336" for r in trade_returns_pct]
+            pnl_texts = []
+            for td in trade_dates:
+                info = exit_info_map.get(td)
+                if info is not None:
+                    md_label = "Switch" if info["mode"] == 2 else "Grid"
+                    pnl_texts.append(
+                        f"{info['reason']}({md_label})<br>"
+                        f"入场: {info['entry_dt'].date()} @ {info['entry_px']:.4f}<br>"
+                        f"离场: {td.date()} @ {info['exit_px']:.4f}<br>"
+                        f"收益: {info['return_pct']:+.2f}%"
+                    )
+                else:
+                    pnl_texts.append(f"收益: {trade_returns_pct[len(pnl_texts)]:+.2f}%")
             fig_ov.add_trace(go.Bar(
                 x=trade_dates, y=trade_returns_pct, marker_color=colors,
-                name="Trade PnL %",
+                name="Trade PnL %", text=pnl_texts, hoverinfo="text",
             ), row=4, col=1)
 
         fig_ov.update_layout(
