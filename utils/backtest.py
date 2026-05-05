@@ -86,21 +86,20 @@ _backtest_kernel = None
 
 _BACKTEST_KERNEL_CODE = r"""
 extern "C" __global__ void backtest_kernel(
-    const double* close,        // [n_bars] — 收盘价，用于 NAV 估值
-    const double* fill_price,   // [n_bars] — 成交价，通常为次日开盘价
-    const bool* entries,        // [n_combos * n_bars]
-    const bool* exits,          // [n_combos * n_bars]
-    const double* sizes,        // [n_combos * n_bars]
-    double* metrics,            // [n_combos * 6] — 每组合 6 个指标
+    const double* __restrict__ close,
+    const double* __restrict__ fill_price,
+    const bool* __restrict__ entries,
+    const bool* __restrict__ exits,
+    const double* __restrict__ sizes,
+    double* __restrict__ metrics,
     int n_bars,
     int n_combos,
+    int n_padded,
     double init_cash,
-    int annual_factor            // 年化因子：日频 = 365
+    int annual_factor
 ) {
     int combo_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (combo_idx >= n_combos) return;
-
-    int offset = combo_idx * n_bars;
 
     double cash = init_cash;
     double position = 0.0;
@@ -121,9 +120,9 @@ extern "C" __global__ void backtest_kernel(
         double fp = fill_price[i];
         if (cl <= 0.0 || isnan(cl)) continue;
 
-        bool entry_sig = entries[offset + i];
-        bool exit_sig = exits[offset + i];
-        double sz = sizes[offset + i];
+        bool entry_sig = entries[i * n_padded + combo_idx];
+        bool exit_sig = exits[i * n_padded + combo_idx];
+        double sz = sizes[i * n_padded + combo_idx];
 
         // ── 入场：以 fill_price（次日开盘价）成交 ──
         if (entry_sig && !in_position && fp > 0.0 && !isnan(fp)) {
@@ -226,41 +225,38 @@ def _get_backtest_kernel():
 
 def run_backtest_batch(
     close: np.ndarray,
-    entries: np.ndarray,    # [n_combos, n_bars] bool
-    exits: np.ndarray,      # [n_combos, n_bars] bool
-    sizes: np.ndarray,      # [n_combos, n_bars] float64
+    entries: np.ndarray,    # [n_bars, n_combos] if transposed, else [n_combos, n_bars]
+    exits: np.ndarray,
+    sizes: np.ndarray,
     init_cash: float = 100_000.0,
     annual_factor: int = 365,
     n_combos: int = 0,
-    open_: np.ndarray | None = None,  # 开盘价 [n_bars]
+    open_: np.ndarray | None = None,
+    transposed: bool = False,  # True: [n_bars, n_combos]; False: legacy [n_combos, n_bars]
 ) -> np.ndarray:
     """GPU 批量回测：每 CUDA 线程处理一组信号的完整回测。
 
-    成交模型：
-      - 未传 open_: close 本身作为成交价
-      - 传入 open_: fill_price = shift(open_, -1)，即信号 bar i 的
-        指令在 bar i+1 的 Open 成交（消除前视偏差）
-
     Args:
         close:  收盘价 [n_bars]，用于 NAV 估值
-        entries/exits/sizes: 信号数组 [n_combos, n_bars]
-        init_cash / annual_factor: 初始资金 / 年化因子
-        n_combos: 有效组合数（<= entries.shape[0]）
-        open_:  可选，开盘价 [n_bars]，传入则启用 next-bar Open 成交
-
+        entries/exits/sizes: 信号数组，布局由 transposed 参数决定
+        transposed: True=[n_bars, n_combos]（合并写入）, False=[n_combos, n_bars]（兼容旧代码）
     Returns:
         numpy 数组 [n_combos, 6]
     """
     cp = xp()
-    n_bars = entries.shape[1]
-    actual_combos = n_combos if n_combos > 0 else entries.shape[0]
+    if transposed:
+        n_bars = entries.shape[0]
+        actual_combos = n_combos if n_combos > 0 else entries.shape[1]
+    else:
+        n_bars = entries.shape[1]
+        actual_combos = n_combos if n_combos > 0 else entries.shape[0]
     if n_bars == 0 or actual_combos == 0:
         return np.zeros((actual_combos, 6))
 
-    # 成交价：若传了 open_，shift(-1) 得到次日开盘价
+    # 成交价
     if open_ is not None:
         fill_price = np.roll(open_, -1)
-        fill_price[-1] = close[-1]  # 最后一天无次日数据，用收盘价
+        fill_price[-1] = close[-1]
     else:
         fill_price = close.copy()
 
@@ -268,18 +264,21 @@ def run_backtest_batch(
     grid_size = (actual_combos + block_size - 1) // block_size
     padded = grid_size * block_size
 
-    entries_flat = cp.zeros(padded * n_bars, dtype=cp.bool_)
-    exits_flat = cp.zeros(padded * n_bars, dtype=cp.bool_)
-    sizes_flat = cp.zeros(padded * n_bars, dtype=cp.float64)
-
-    entries_cp = cp.asarray(entries.ravel())
-    exits_cp = cp.asarray(exits.ravel())
-    sizes_cp = cp.asarray(sizes.ravel())
-
-    n_flat = actual_combos * n_bars
-    entries_flat[:n_flat] = entries_cp
-    exits_flat[:n_flat] = exits_cp
-    sizes_flat[:n_flat] = sizes_cp
+    if transposed:
+        entries_flat = cp.zeros((n_bars, padded), dtype=cp.bool_)
+        exits_flat = cp.zeros((n_bars, padded), dtype=cp.bool_)
+        sizes_flat = cp.zeros((n_bars, padded), dtype=cp.float64)
+        entries_flat[:, :actual_combos] = cp.asarray(entries)
+        exits_flat[:, :actual_combos] = cp.asarray(exits)
+        sizes_flat[:, :actual_combos] = cp.asarray(sizes)
+    else:
+        entries_flat = cp.zeros(padded * n_bars, dtype=cp.bool_)
+        exits_flat = cp.zeros(padded * n_bars, dtype=cp.bool_)
+        sizes_flat = cp.zeros(padded * n_bars, dtype=cp.float64)
+        n_flat = actual_combos * n_bars
+        entries_flat[:n_flat] = cp.asarray(entries.ravel())
+        exits_flat[:n_flat] = cp.asarray(exits.ravel())
+        sizes_flat[:n_flat] = cp.asarray(sizes.ravel())
 
     close_d = cp.asarray(close, dtype=cp.float64)
     fill_d = cp.asarray(fill_price, dtype=cp.float64)
@@ -289,8 +288,12 @@ def run_backtest_batch(
     kernel(
         (grid_size,), (block_size,),
         (
-            close_d, fill_d, entries_flat, exits_flat, sizes_flat, metrics_d,
-            n_bars, actual_combos, init_cash, annual_factor,
+            close_d, fill_d,
+            entries_flat.ravel() if transposed else entries_flat,
+            exits_flat.ravel() if transposed else exits_flat,
+            sizes_flat.ravel() if transposed else sizes_flat,
+            metrics_d,
+            n_bars, actual_combos, padded, init_cash, annual_factor,
         ),
     )
 

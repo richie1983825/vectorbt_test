@@ -1,500 +1,287 @@
 """
-VectorBT Walk-Forward — Polyfit-Switch v3 vs Polyfit-Grid 对比。
+VectorBT Walk-Forward — Polyfit-Grid vs Polyfit-Switch-v6 对比入口。
 
-所有回测均使用 Walk-Forward（训练→OOS），禁止全量回测。
-每次回测同时列出 return / balanced / robust 三种评分结果。
+调用 workflows/polyfit_grid.py 和 workflows/polyfit_switch.py 执行 WF 扫描，
+输出六组合对比 + HTML 报告。
 """
 
-import os, warnings, numpy as np, pandas as pd
-from itertools import product
+import os, time, warnings
+import numpy as np
+import pandas as pd
+import vectorbt as vbt
+
 warnings.filterwarnings("ignore")
 
-from utils.gpu import detect_gpu, print_gpu_info, gpu
+from utils.gpu import detect_gpu, print_gpu_info
 from utils.data import load_data
-from utils.indicators import compute_polyfit_switch_indicators, compute_polyfit_base_only, add_trend_vol_indicators
-from utils.backtest import run_backtest, run_backtest_batch
-from utils.scoring import select_by_return, select_balanced, select_robust
+from utils.indicators import compute_polyfit_base_only, add_trend_vol_indicators, compute_polyfit_switch_indicators
+from utils.backtest import run_backtest
 from utils.walkforward import generate_monthly_windows
-from strategies.polyfit_switch import generate_polyfit_switch_signals, generate_polyfit_switch_signals_batch
-from strategies.polyfit_grid import scan_polyfit_grid, generate_grid_signals
+from strategies.polyfit_grid import generate_grid_signals
+from strategies.polyfit_switch import generate_grid_priority_switch_signals_v6
+from workflows.polyfit_grid import run_grid_wf, GRID_PARAMS_KEYS, load_grid_cache
+from workflows.polyfit_switch import run_switch_wf, SWITCH_PARAMS_KEYS
 
 REPORTS_DIR = "reports"
 
-# ══════════════════════════════════════════════════════════════
-# 对比参数
-# ══════════════════════════════════════════════════════════════
-GRID_PARAMS_KEYS = [
-    "trend_window_days", "vol_window_days",
-    "base_grid_pct", "volatility_scale", "trend_sensitivity",
-    "max_grid_levels", "take_profit_grid", "stop_loss_grid",
-    "max_holding_days", "cooldown_days",
-    "min_signal_strength", "position_size", "position_sizing_coef",
-]
-SWITCH_PARAMS_KEYS = GRID_PARAMS_KEYS + [
-    "switch_deviation_m1", "switch_deviation_m2", "switch_trailing_stop",
-    "switch_fast_ma", "switch_slow_ma",
+# 六组合定义
+SIX_COMBOS = [
+    ("Grid-return",               "Polyfit-Grid",        "return"),
+    ("Grid-balanced",             "Polyfit-Grid",        "balanced"),
+    ("Switch-return",             "Polyfit-Switch-v6",   "return"),
+    ("Switch-balanced",           "Polyfit-Switch-v6",   "balanced"),
+    ("Grid-ret+Switch-bal",       "Polyfit-Switch-v6",   "return-grid+balanced-switch"),
+    ("Grid-bal+Switch-ret",       "Polyfit-Switch-v6",   "balanced-grid+return-switch"),
 ]
 
-SELECTORS = {"return": select_by_return, "balanced": select_balanced, "robust": select_robust}
+
+def _print_six_combo_table(all_wf: pd.DataFrame):
+    """输出六组合 WF OOS 对比表。"""
+    all_wf["excess"] = all_wf["test_return"] - all_wf["buy_hold_return"]
+
+    print(f"\n{'═' * 100}")
+    print(f"  六组合 Walk-Forward OOS 对比 (22m train / 12m test)")
+    print(f"{'═' * 100}")
+    print(f"  {'#':>2s} {'组合':<28s} {'OOS':>8s} {'α':>8s} {'Sharpe':>7s} {'maxDD':>7s} {'pos%':>5s} {'>BH':>5s}")
+    print(f"  {'─'*2} {'─'*28} {'─'*8} {'─'*8} {'─'*7} {'─'*7} {'─'*5} {'─'*5}")
+
+    best_name = None
+    best_oos = -999
+    combo_stats = {}
+
+    for i, (label, strat, sel) in enumerate(SIX_COMBOS, 1):
+        sub = all_wf[(all_wf["strategy"] == strat) & (all_wf["selector"] == sel)]
+        if sub.empty:
+            print(f"  {i:>2d} {label:<28s} (无数据)")
+            continue
+        oos = sub["test_return"].mean()
+        alpha = sub["excess"].mean()
+        sharpe = sub["test_sharpe"].mean()
+        dd = sub["test_max_dd"].mean()
+        pos = (sub["test_return"] > 0).mean()
+        beat = (sub["excess"] > 0).mean()
+        marker = ""
+        if oos > best_oos:
+            best_oos = oos
+            best_name = label
+            marker = " ★"
+        print(f"  {i:>2d} {label:<28s} {oos:>+7.1%}  {alpha:>+7.1%}  {sharpe:>7.3f}  {dd:>+7.1%}  {pos:>.0%}  {beat:>.0%}{marker}")
+        combo_stats[label] = {"oos": oos, "alpha": alpha, "sharpe": sharpe, "max_dd": dd,
+                               "strat": strat, "sel": sel}
+
+    print(f"\n  ★ 最优组合: {best_name} (OOS={best_oos:+.1%})")
+    return best_name, combo_stats
 
 
-def _make_grid_eval(open_raw):
-    def _eval(close_warmup_all, test_offset, params):
-        from utils.backtest import run_backtest as _bt
-        base_ind = compute_polyfit_base_only(close_warmup_all, fit_window_days=252)
-        common_idx = base_ind.index
-        if len(common_idx) == 0:
-            return {"test_return": 0.0, "test_sharpe": 0.0, "test_max_dd": 0.0, "num_trades": 0, "win_rate": 0.0}
-        tw = int(params.get("trend_window_days", 20))
-        vw = int(params.get("vol_window_days", 20))
-        ind_full = add_trend_vol_indicators(base_ind, close_warmup_all, tw, vw)
-        test_start = close_warmup_all.index[test_offset]
-        ind_test = ind_full.loc[ind_full.index >= test_start]
-        if ind_test.empty:
-            return {"test_return": 0.0, "test_sharpe": 0.0, "test_max_dd": 0.0, "num_trades": 0, "win_rate": 0.0}
-        cl_test = close_warmup_all.loc[ind_test.index]
-        op_test = open_raw.reindex(ind_test.index)
-        e, x, s = generate_grid_signals(
-            cl_test.values, ind_test["PolyDevPct"].values, ind_test["PolyDevTrend"].values,
-            ind_test["RollingVolPct"].values, ind_test["PolyBasePred"].values,
-            base_grid_pct=params.get("base_grid_pct", 0.012),
-            volatility_scale=params.get("volatility_scale", 1.0),
-            trend_sensitivity=params.get("trend_sensitivity", 8.0),
-            max_grid_levels=int(params.get("max_grid_levels", 3)),
-            take_profit_grid=params.get("take_profit_grid", 0.85),
-            stop_loss_grid=params.get("stop_loss_grid", 1.6),
-            max_holding_days=int(params.get("max_holding_days", 45)),
-            cooldown_days=int(params.get("cooldown_days", 1)),
-            min_signal_strength=params.get("min_signal_strength", 0.45),
-            position_size=params.get("position_size", 0.5),
-            position_sizing_coef=params.get("position_sizing_coef", 30.0),
+def _generate_reports(close_hfq, open_raw, high_raw, low_raw, volume_raw,
+                      data_hfq, all_wf, best_name, combo_stats):
+    """基于最优组合生成全量回测 HTML 报告。"""
+    from utils.reports import (
+        generate_polyfit_grid_report,
+        generate_polyfit_switch_report,
+        build_index_html,
+    )
+
+    best_info = combo_stats[best_name]
+    best_strat = best_info["strat"]
+    best_sel = best_info["sel"]
+
+    print(f"\n{'═' * 70}")
+    print(f"  Generating HTML Reports — 最优: {best_name}")
+    print(f"{'═' * 70}")
+
+    base_ind_full = compute_polyfit_base_only(close_hfq, fit_window_days=252, ma_windows=[])
+    common_idx_full = base_ind_full.index
+    df_report = data_hfq.loc[common_idx_full].copy()
+    df_report["PolyBasePred"] = base_ind_full["PolyBasePred"]
+    reports_meta = []
+
+    # 最优窗口参数
+    best_sub = all_wf[(all_wf["strategy"] == best_strat) & (all_wf["selector"] == best_sel)]
+    if best_sub.empty:
+        best_sub = all_wf[(all_wf["strategy"] == "Polyfit-Grid") & (all_wf["selector"] == "balanced")]
+    best_row = best_sub.nlargest(1, "test_return").iloc[0]
+
+    tw = int(best_row["trend_window_days"])
+    vw = int(best_row["vol_window_days"])
+    grid_p = {
+        "trend_window_days": tw, "vol_window_days": vw,
+        "base_grid_pct": best_row["base_grid_pct"],
+        "volatility_scale": best_row["volatility_scale"],
+        "trend_sensitivity": best_row["trend_sensitivity"],
+        "max_grid_levels": int(best_row["max_grid_levels"]),
+        "take_profit_grid": best_row["take_profit_grid"],
+        "stop_loss_grid": best_row["stop_loss_grid"],
+        "max_holding_days": int(best_row["max_holding_days"]),
+        "cooldown_days": int(best_row["cooldown_days"]),
+        "min_signal_strength": best_row["min_signal_strength"],
+        "position_size": best_row["position_size"],
+        "position_sizing_coef": best_row["position_sizing_coef"],
+    }
+
+    # ── Grid 报告 ──
+    grid_ind = add_trend_vol_indicators(base_ind_full, close_hfq, trend_window_days=tw, vol_window_days=vw)
+    idx_g = grid_ind.index
+    cl_g = close_hfq.loc[idx_g]
+    op_g = open_raw.reindex(idx_g)
+    e_g, x_g, s_g = generate_grid_signals(
+        cl_g.values, grid_ind["PolyDevPct"].values, grid_ind["PolyDevTrend"].values,
+        grid_ind["RollingVolPct"].values, grid_ind["PolyBasePred"].values,
+        base_grid_pct=grid_p["base_grid_pct"], volatility_scale=grid_p["volatility_scale"],
+        trend_sensitivity=grid_p["trend_sensitivity"], max_grid_levels=grid_p["max_grid_levels"],
+        take_profit_grid=grid_p["take_profit_grid"], stop_loss_grid=grid_p["stop_loss_grid"],
+        max_holding_days=grid_p["max_holding_days"], cooldown_days=grid_p["cooldown_days"],
+        min_signal_strength=grid_p["min_signal_strength"],
+        position_size=grid_p["position_size"], position_sizing_coef=grid_p["position_sizing_coef"],
+    )
+    grid_params_report = {k: best_row[k] for k in GRID_PARAMS_KEYS if k in best_row.index}
+    grid_meta = generate_polyfit_grid_report(
+        df_report, cl_g, e_g, x_g, s_g, params=grid_params_report,
+        name="Polyfit-Grid", reports_dir=REPORTS_DIR, open_=op_g,
+    )
+    reports_meta.append(grid_meta)
+
+    # ── Switch 报告（如果最优组合包含 Switch）──
+    is_switch = best_strat == "Polyfit-Switch-v6"
+    if is_switch:
+        sw_ind = compute_polyfit_switch_indicators(
+            close_hfq, fit_window_days=252, ma_windows=[20, 60],
+            trend_window_days=tw, vol_window_days=vw,
         )
-        if e.sum() == 0:
-            return {"test_return": 0.0, "test_sharpe": 0.0, "test_max_dd": 0.0, "num_trades": 0, "win_rate": 0.0}
-        m = _bt(cl_test, e, x, s, open_=op_test)
-        return {"test_return": m["total_return"], "test_sharpe": m["sharpe_ratio"],
-                "test_max_dd": m["max_drawdown"], "num_trades": m["num_trades"], "win_rate": m["win_rate"]}
-    return _eval
+        idx_s = sw_ind.index
+        cl_s = close_hfq.loc[idx_s]; op_s = open_raw.reindex(idx_s)
+        hi_s = high_raw.reindex(idx_s); lo_s = low_raw.reindex(idx_s)
+        vol_s = volume_raw.reindex(idx_s)
 
+        dev_pct_s = sw_ind["PolyDevPct"].values
+        dev_trend_s = sw_ind["PolyDevTrend"].values
+        vol_pct_s = sw_ind["RollingVolPct"].values
+        poly_base_s = sw_ind["PolyBasePred"].values
 
-def _make_switch_eval(open_raw):
-    def _eval(close_warmup_all, test_offset, params):
-        from utils.backtest import run_backtest as _bt
-        ind = compute_polyfit_switch_indicators(
-            close_warmup_all, fit_window_days=252, ma_windows=[5,10,20,60],
-            trend_window_days=int(params.get("trend_window_days", 20)),
-            vol_window_days=int(params.get("vol_window_days", 20)),
+        e_grid_s, x_grid_s, s_grid_s = generate_grid_signals(
+            cl_s.values, dev_pct_s, dev_trend_s, vol_pct_s, poly_base_s,
+            base_grid_pct=grid_p["base_grid_pct"], volatility_scale=grid_p["volatility_scale"],
+            trend_sensitivity=grid_p["trend_sensitivity"], max_grid_levels=grid_p["max_grid_levels"],
+            take_profit_grid=grid_p["take_profit_grid"], stop_loss_grid=grid_p["stop_loss_grid"],
+            max_holding_days=grid_p["max_holding_days"], cooldown_days=grid_p["cooldown_days"],
+            min_signal_strength=grid_p["min_signal_strength"],
+            position_size=grid_p["position_size"], position_sizing_coef=grid_p["position_sizing_coef"],
         )
-        test_start = close_warmup_all.index[test_offset]
-        ind_test = ind.loc[ind.index >= test_start]
-        if ind_test.empty:
-            return {"test_return": 0.0, "test_sharpe": 0.0, "test_max_dd": 0.0, "num_trades": 0, "win_rate": 0.0}
-        cl_test = close_warmup_all.loc[ind_test.index]
-        op_test = open_raw.reindex(ind_test.index)
-        sw_fast = int(params.get("switch_fast_ma", 20))
-        sw_slow = int(params.get("switch_slow_ma", 60))
-        e, x, s, _m = generate_polyfit_switch_signals(
-            cl_test.values,
-            ind_test["PolyDevPct"].values, ind_test["PolyDevTrend"].values,
-            ind_test["RollingVolPct"].values, ind_test["PolyBasePred"].values,
-            ind_test[f"MA{sw_fast}"].values, ind_test[f"MA{sw_slow}"].values,
-            base_grid_pct=params.get("base_grid_pct", 0.012),
-            volatility_scale=params.get("volatility_scale", 1.0),
-            trend_sensitivity=params.get("trend_sensitivity", 8.0),
-            max_grid_levels=int(params.get("max_grid_levels", 3)),
-            take_profit_grid=params.get("take_profit_grid", 0.85),
-            stop_loss_grid=params.get("stop_loss_grid", 1.6),
-            max_holding_days=int(params.get("max_holding_days", 45)),
-            cooldown_days=int(params.get("cooldown_days", 1)),
-            min_signal_strength=params.get("min_signal_strength", 0.45),
-            position_size=params.get("position_size", 0.5),
-            position_sizing_coef=params.get("position_sizing_coef", 30.0),
-            switch_deviation_m1=params.get("switch_deviation_m1", 0.03),
-            switch_deviation_m2=params.get("switch_deviation_m2", 0.02),
-            switch_trailing_stop=params.get("switch_trailing_stop", 0.05),
+
+        sw_e, sw_x, sw_sz = generate_grid_priority_switch_signals_v6(
+            cl_s.values, dev_pct_s, dev_trend_s, vol_pct_s, poly_base_s,
+            e_grid_s, x_grid_s, ma20=sw_ind["MA20"].values, ma60=sw_ind["MA60"].values,
+            trend_entry_dp=float(best_row.get("trend_entry_dp", 0.0)),
+            trend_confirm_dp_slope=float(best_row.get("trend_confirm_dp_slope", 0.0)),
+            trend_atr_mult=float(best_row.get("trend_atr_mult", 2.0)),
+            trend_atr_window=14,
+            trend_vol_climax=float(best_row.get("trend_vol_climax", 2.5)),
+            trend_decline_days=int(best_row.get("trend_decline_days", 2)),
+            enable_ohlcv_filter=bool(best_row.get("enable_ohlcv_filter", True)),
+            enable_early_exit=bool(best_row.get("enable_early_exit", True)),
+            high=hi_s.values, low=lo_s.values, open_=op_s.values, volume=vol_s.values,
         )
-        if e.sum() == 0:
-            return {"test_return": 0.0, "test_sharpe": 0.0, "test_max_dd": 0.0, "num_trades": 0, "win_rate": 0.0}
-        m = _bt(cl_test, e, x, s, open_=op_test)
-        return {"test_return": m["total_return"], "test_sharpe": m["sharpe_ratio"],
-                "test_max_dd": m["max_drawdown"], "num_trades": m["num_trades"], "win_rate": m["win_rate"]}
-    return _eval
+
+        fill_price_s = op_s.shift(-1).reindex(idx_s)
+        pf_grid_only = vbt.Portfolio.from_signals(
+            fill_price_s, entries=pd.Series(e_grid_s, index=idx_s),
+            exits=pd.Series(x_grid_s, index=idx_s),
+            size=pd.Series(s_grid_s, index=idx_s),
+            size_type="percent", init_cash=1.0, freq="D",
+        )
+        pf_switch_only = vbt.Portfolio.from_signals(
+            fill_price_s, entries=pd.Series(sw_e, index=idx_s),
+            exits=pd.Series(sw_x, index=idx_s),
+            size=pd.Series(sw_sz, index=idx_s),
+            size_type="percent", init_cash=1.0, freq="D",
+        )
+        e_merged = e_grid_s | sw_e
+        x_merged = x_grid_s | sw_x
+        s_merged = np.where(e_grid_s, s_grid_s, sw_sz)
+        modes_merged = np.zeros(len(e_merged), dtype=int)
+        modes_merged[e_grid_s] = 1
+        modes_merged[sw_e] = 2
+
+        switch_params = {
+            **grid_p,
+            "trend_entry_dp": float(best_row.get("trend_entry_dp", 0.0)),
+            "trend_confirm_dp_slope": float(best_row.get("trend_confirm_dp_slope", 0.0)),
+            "trend_atr_mult": float(best_row.get("trend_atr_mult", 2.0)),
+            "trend_vol_climax": float(best_row.get("trend_vol_climax", 2.5)),
+            "trend_decline_days": int(best_row.get("trend_decline_days", 2)),
+            "enable_ohlcv_filter": bool(best_row.get("enable_ohlcv_filter", True)),
+            "enable_early_exit": bool(best_row.get("enable_early_exit", True)),
+        }
+        sw_meta = generate_polyfit_switch_report(
+            df_report, cl_s, e_merged, x_merged, s_merged, modes_merged,
+            params=switch_params, name="Polyfit-Switch-v6",
+            reports_dir=REPORTS_DIR, open_=op_s,
+            pf_grid=pf_grid_only, pf_switch=pf_switch_only,
+        )
+        if sw_meta is not None:
+            reports_meta.append(sw_meta)
+
+    # ── 索引页 ──
+    if reports_meta:
+        index_html = build_index_html(reports_meta, REPORTS_DIR)
+        index_path = f"{REPORTS_DIR}/index.html"
+        with open(index_path, "w") as f:
+            f.write(index_html)
+        print(f"\n  Index → {index_path}")
+        print(f"  Open: file://{os.path.abspath(index_path)}")
 
 
 if __name__ == "__main__":
     os.makedirs(REPORTS_DIR, exist_ok=True)
     gpu_info = detect_gpu()
     print_gpu_info(gpu_info)
+    _t0_total = time.time()
 
+    # ── 加载数据 ──
     print("Loading data…")
     data_hfq = load_data("data/1d/512890.SH_hfq.parquet")
-    close_hfq = data_hfq["Close"]
-    open_raw = data_hfq["Open"]  # 用 hfq Open 确保与 hfq Close 同一价格尺度
+    close_hfq = data_hfq["Close"]; open_raw = data_hfq["Open"]
+    high_raw = data_hfq["High"]; low_raw = data_hfq["Low"]
+    volume_raw = data_hfq["Volume"]
     print(f"  {len(data_hfq)} bars  {data_hfq.index[0].date()} → {data_hfq.index[-1].date()}")
 
-    grid_eval = _make_grid_eval(open_raw)
-    switch_eval = _make_switch_eval(open_raw)
-
-    # ── Walk-Forward：Grid 和 Switch 共用同一套 Grid 参数 ──
-    wf_all = []
     windows = generate_monthly_windows(
         close_hfq.index, train_months=22, test_months=12,
         step_months=3, warmup_months=12,
     )
-    print(f"\n{'=' * 70}")
-    print(f"  Walk-Forward (22m train, 12m test, {len(windows)} windows)")
-    print(f"{'=' * 70}")
+    print(f"  WF 窗口: {len(windows)} 个")
 
-    for wi, w in enumerate(windows):
-        n_train_bars = w.test_start - w.train_start
-        if n_train_bars < 252:
-            continue
+    # ── Stage 1: Grid WF ──
+    print(f"\n{'═' * 70}")
+    print(f"  Stage 1/2: Polyfit-Grid Walk-Forward")
+    print(f"{'═' * 70}")
+    t1 = time.time()
+    grid_df = run_grid_wf(close_hfq, open_raw, windows=windows, force_rescan=False)
+    print(f"  Stage 1 done: {time.time()-t1:.0f}s")
 
-        close_train = close_hfq.iloc[w.train_start:w.test_start]
-        close_warmup_all = close_hfq.iloc[w.warmup_start:w.test_end]
-        test_offset = w.test_start - w.warmup_start
-        test_close = close_hfq.iloc[w.test_start:w.test_end]
-        bh_return = ((test_close.iloc[-1] - test_close.iloc[0]) / test_close.iloc[0]
-                     if len(test_close) >= 2 else 0.0)
+    # ── Stage 2: Switch-v6 WF ──
+    print(f"\n{'═' * 70}")
+    print(f"  Stage 2/2: Polyfit-Switch-v6 Walk-Forward")
+    print(f"{'═' * 70}")
+    t2 = time.time()
+    switch_df = run_switch_wf(close_hfq, open_raw, high_raw, low_raw, volume_raw,
+                              windows=windows, grid_wf_df=grid_df)
+    print(f"  Stage 2 done: {time.time()-t2:.0f}s")
 
-        # ── Stage 1: Grid 扫描（两个策略共享） ──
-        grid_results = scan_polyfit_grid(close_train, open_=open_raw)
-        if grid_results.empty:
-            continue
+    # ── 合并结果 ──
+    all_wf = pd.concat([grid_df, switch_df], ignore_index=True)
+    all_wf.to_csv(f"{REPORTS_DIR}/wf_comparison.csv", index=False)
+    print(f"\n  Results → {REPORTS_DIR}/wf_comparison.csv")
 
-        # 提取 Switch Stage 2 需要的参数 key
-        _grid_keys_for_stage2 = [k for k in GRID_PARAMS_KEYS
-                                 if k not in ("max_holding_days", "cooldown_days")]
+    # ── 六组合输出 ──
+    best_name, combo_stats = _print_six_combo_table(all_wf)
 
-        for sel_name, sel_fn in SELECTORS.items():
-            try:
-                best_grid = sel_fn(grid_results)
-            except Exception:
-                continue
-            grid_params = {k: best_grid[k] for k in GRID_PARAMS_KEYS if k in best_grid.index}
+    # ── HTML 报告 ──
+    _generate_reports(close_hfq, open_raw, high_raw, low_raw, volume_raw,
+                      data_hfq, all_wf, best_name, combo_stats)
 
-            # Grid OOS 评估
-            grid_oos = grid_eval(close_warmup_all, test_offset, grid_params)
-            wf_all.append({
-                "strategy": "Polyfit-Grid", "train_months": 22,
-                "selector": sel_name, "n_train_bars": n_train_bars,
-                "train_return": best_grid["total_return"],
-                "train_sharpe": best_grid["sharpe_ratio"],
-                "train_max_dd": best_grid["max_drawdown"],
-                "buy_hold_return": bh_return,
-                **grid_oos, **grid_params,
-            })
-
-            # ── Stage 2: Switch 扫描（基于同一套 Grid 参数） ──
-            tw_s = int(grid_params["trend_window_days"])
-            vw_s = int(grid_params["vol_window_days"])
-            best_bgp = grid_params["base_grid_pct"]
-            best_vs = grid_params["volatility_scale"]
-            best_ts = grid_params["trend_sensitivity"]
-            best_max_gl = int(grid_params["max_grid_levels"])
-            best_tpg = grid_params["take_profit_grid"]
-            best_slg = grid_params["stop_loss_grid"]
-            best_pos_sz = grid_params["position_size"]
-            best_pos_coef = grid_params["position_sizing_coef"]
-            best_min_ss = grid_params["min_signal_strength"]
-
-            sw_m1_vals = [0.02, 0.03, 0.04, 0.05]
-            sw_m2_vals = [0.005, 0.01, 0.015, 0.02]
-            sw_tr_vals = [0.02, 0.03, 0.05, 0.07, 0.10]
-            sw_fast_vals = [5, 10, 20]
-            sw_slow_vals = [10, 20, 60]
-            all_ma_sw = sorted(set(sw_fast_vals + sw_slow_vals))
-
-            sw_combos = [(m1, m2, tr, fa, sl) for m1, m2, tr, fa, sl in product(
-                sw_m1_vals, sw_m2_vals, sw_tr_vals, sw_fast_vals, sw_slow_vals)
-                if m2 < m1 and fa < sl]
-            n_sw = len(sw_combos)
-
-            indicators = compute_polyfit_switch_indicators(
-                close_train, fit_window_days=252,
-                ma_windows=all_ma_sw,
-                trend_window_days=tw_s, vol_window_days=vw_s,
-            )
-            com_idx = indicators.index
-            if len(com_idx) == 0:
-                continue
-            cl_al = close_train.loc[com_idx]
-            cl_arr = cl_al.values
-
-            if gpu()["cupy_available"] and n_sw > 0:
-                poly_base_arr = indicators["PolyBasePred"].values
-                dev_pct_arr = indicators["PolyDevPct"].values
-                dev_trend_arr = indicators["PolyDevTrend"].values
-                vol_arr = indicators["RollingVolPct"].values
-                ma_all_arr = np.array([indicators[f"MA{mw}"].values for mw in all_ma_sw])
-                ma_to_idx = {w: i for i, w in enumerate(all_ma_sw)}
-
-                m1_a = np.array([c[0] for c in sw_combos])
-                m2_a = np.array([c[1] for c in sw_combos])
-                str_a = np.array([c[2] for c in sw_combos])
-                fi_a = np.array([ma_to_idx[c[3]] for c in sw_combos], dtype=np.int32)
-                si_a = np.array([ma_to_idx[c[4]] for c in sw_combos], dtype=np.int32)
-                bgp_a = np.full(n_sw, best_bgp)
-                vs_a = np.full(n_sw, best_vs)
-                ts_a = np.full(n_sw, best_ts)
-                tpg_a = np.full(n_sw, best_tpg)
-                slg_a = np.full(n_sw, best_slg)
-                mgl_a = np.full(n_sw, best_max_gl, dtype=np.int32)
-                cd_a = np.full(n_sw, 1, dtype=np.int32)
-                mss_a = np.full(n_sw, best_min_ss)
-                ps_a = np.full(n_sw, best_pos_sz)
-                psc_a = np.full(n_sw, best_pos_coef)
-
-                entries_b, exits_b, sizes_b = generate_polyfit_switch_signals_batch(
-                    cl_arr, dev_pct_arr,
-                    dev_trend_arr.reshape(1, -1), vol_arr.reshape(1, -1),
-                    poly_base_arr, ma_all_arr, fi_a, si_a,
-                    bgp_a, vs_a, ts_a, tpg_a, slg_a,
-                    m1_a, m2_a, str_a,
-                    max_grid_levels_arr=mgl_a,
-                    cooldown_days_arr=cd_a,
-                    min_signal_strength_arr=mss_a,
-                    position_size_arr=ps_a,
-                    position_sizing_coef_arr=psc_a,
-                )
-                op_al = open_raw.iloc[close_train.index.get_indexer(com_idx)] if open_raw is not None else None
-                bt = run_backtest_batch(cl_arr, entries_b, exits_b, sizes_b,
-                                        n_combos=n_sw, open_=op_al.values if op_al is not None else None)
-                sw_results_list = []
-                for idx_sw, (m1, m2, tr, fa, sl) in enumerate(sw_combos):
-                    if int(bt[idx_sw][4]) == 0:
-                        continue
-                    sw_results_list.append({
-                        "total_return": bt[idx_sw][0], "sharpe_ratio": bt[idx_sw][1],
-                        "max_drawdown": bt[idx_sw][2], "calmar_ratio": bt[idx_sw][3],
-                        "num_trades": int(bt[idx_sw][4]), "win_rate": bt[idx_sw][5],
-                        "switch_deviation_m1": m1, "switch_deviation_m2": m2,
-                        "switch_trailing_stop": tr,
-                        "switch_fast_ma": fa, "switch_slow_ma": sl,
-                        **grid_params,
-                    })
-                sw_results = pd.DataFrame(sw_results_list)
-            else:
-                sw_results_list = []
-                for m1, m2, tr, fa, sl in sw_combos:
-                    e_sw, x_sw, sz_sw, _ = generate_polyfit_switch_signals(
-                        cl_arr, dev_pct_arr, dev_trend_arr, vol_arr,
-                        poly_base_arr,
-                        indicators[f"MA{fa}"].values, indicators[f"MA{sl}"].values,
-                        base_grid_pct=best_bgp, volatility_scale=best_vs,
-                        trend_sensitivity=best_ts, max_grid_levels=best_max_gl,
-                        take_profit_grid=best_tpg, stop_loss_grid=best_slg,
-                        max_holding_days=45, cooldown_days=1,
-                        min_signal_strength=best_min_ss,
-                        position_size=best_pos_sz,
-                        position_sizing_coef=best_pos_coef,
-                        switch_deviation_m1=m1, switch_deviation_m2=m2,
-                        switch_trailing_stop=tr,
-                    )
-                    if e_sw.sum() == 0:
-                        continue
-                    m = run_backtest(cl_al, e_sw, x_sw, sz_sw, open_=op_al)
-                    m["switch_deviation_m1"] = m1
-                    m["switch_deviation_m2"] = m2
-                    m["switch_trailing_stop"] = tr
-                    m["switch_fast_ma"] = fa
-                    m["switch_slow_ma"] = sl
-                    m.update(grid_params)
-                    sw_results_list.append(m)
-                sw_results = pd.DataFrame(sw_results_list)
-
-            if sw_results.empty:
-                continue
-
-            try:
-                best_sw = sel_fn(sw_results)
-            except Exception:
-                continue
-            sw_params = {k: best_sw[k] for k in SWITCH_PARAMS_KEYS if k in best_sw.index}
-
-            # Switch OOS 评估
-            switch_oos = switch_eval(close_warmup_all, test_offset, sw_params)
-            wf_all.append({
-                "strategy": "Polyfit-Switch", "train_months": 22,
-                "selector": sel_name, "n_train_bars": n_train_bars,
-                "train_return": best_sw["total_return"],
-                "train_sharpe": best_sw["sharpe_ratio"],
-                "train_max_dd": best_sw["max_drawdown"],
-                "buy_hold_return": bh_return,
-                **switch_oos, **sw_params,
-            })
-
-        if (wi + 1) % 5 == 0:
-            print(f"  {wi + 1}/{len(windows)} windows done")
-
-    # ── 汇总 ──
-    if wf_all:
-        all_wf = pd.DataFrame(wf_all)
-        all_wf["excess"] = all_wf["test_return"] - all_wf["buy_hold_return"]
-        for strat in ["Polyfit-Grid", "Polyfit-Switch"]:
-            print(f"\n  {strat}:")
-            for sel in ["return", "balanced", "robust"]:
-                sub = all_wf[(all_wf["strategy"] == strat) & (all_wf["selector"] == sel)]
-                if sub.empty: continue
-                print(f"    {sel:>10s}: OOS={sub['test_return'].mean():>+7.1%}  "
-                      f"α={sub['excess'].mean():>+7.1%}  "
-                      f"sharpe={sub['test_sharpe'].mean():>7.3f}  "
-                      f"dd={sub['test_max_dd'].mean():>+7.1%}  "
-                      f">BH={(sub['excess']>0).mean():>.0%}  w={len(sub)}")
-
-        print(f"\n{'=' * 90}")
-        print(f"  Walk-Forward 对比: Polyfit-Grid vs Polyfit-Switch v3 (22m)")
-        print(f"{'=' * 90}")
-        print(f"  {'策略':>22s} {'评分':>10s} {'OOS':>8s} {'α':>8s} "
-              f"{'sharpe':>7s} {'max_dd':>7s} {'pos':>5s} {'>BH':>5s} {'w':>4s}")
-        print(f"  {'─'*22} {'─'*10} {'─'*8} {'─'*8} {'─'*7} {'─'*7} {'─'*5} {'─'*5} {'─'*4}")
-        for strat in ["Polyfit-Grid", "Polyfit-Switch"]:
-            for sel in ["return", "balanced", "robust"]:
-                sub = all_wf[(all_wf["strategy"] == strat) & (all_wf["selector"] == sel)]
-                if sub.empty: continue
-                print(f"  {strat:>22s} {sel:>10s} "
-                      f"{sub['test_return'].mean():>+7.1%}  "
-                      f"{sub['excess'].mean():>+7.1%}  "
-                      f"{sub['test_sharpe'].mean():>7.3f}  "
-                      f"{sub['test_max_dd'].mean():>+7.1%}  "
-                      f"{(sub['test_return']>0).mean():>.0%}  "
-                      f"{(sub['excess']>0).mean():>.0%}  "
-                      f"{len(sub):>4d}")
-
-        all_wf.to_csv(f"{REPORTS_DIR}/wf_comparison.csv", index=False)
-        print(f"\n  Results → {REPORTS_DIR}/wf_comparison.csv")
-
-    # ══════════════════════════════════════════════════════════════
-    # HTML 报告生成
-    # ══════════════════════════════════════════════════════════════
-    if len(wf_all) >= 1:
-        print(f"\n{'=' * 70}")
-        print("  Generating HTML Reports")
-        print(f"{'=' * 70}")
-
-        from utils.reports import (
-            generate_polyfit_grid_report,
-            generate_polyfit_switch_report,
-            build_index_html,
-        )
-
-        # 准备全量数据的 df（含 PolyBasePred 用于报告绘图）
-        base_ind_full = compute_polyfit_base_only(close_hfq, fit_window_days=252, ma_windows=[])
-        common_idx_full = base_ind_full.index
-        df_report = data_hfq.loc[common_idx_full].copy()
-        df_report["PolyBasePred"] = base_ind_full["PolyBasePred"]
-        reports_meta = []
-
-        # ── Polyfit-Grid 报告 ──
-        grid_balanced = all_wf[(all_wf["strategy"] == "Polyfit-Grid") & (all_wf["selector"] == "balanced")]
-        best_grid_params = None  # 供 Switch 报告复用
-        if not grid_balanced.empty:
-            best_g = grid_balanced.nlargest(1, "test_return").iloc[0]
-            tw = int(best_g["trend_window_days"])
-            vw = int(best_g["vol_window_days"])
-            best_grid_params = {
-                "trend_window_days": tw, "vol_window_days": vw,
-                "base_grid_pct": best_g["base_grid_pct"],
-                "volatility_scale": best_g["volatility_scale"],
-                "trend_sensitivity": best_g["trend_sensitivity"],
-                "max_grid_levels": int(best_g["max_grid_levels"]),
-                "take_profit_grid": best_g["take_profit_grid"],
-                "stop_loss_grid": best_g["stop_loss_grid"],
-                "max_holding_days": int(best_g["max_holding_days"]),
-                "cooldown_days": int(best_g["cooldown_days"]),
-                "min_signal_strength": best_g["min_signal_strength"],
-                "position_size": best_g["position_size"],
-                "position_sizing_coef": best_g["position_sizing_coef"],
-            }
-            grid_ind = add_trend_vol_indicators(base_ind_full, close_hfq, tw, vw)
-            idx_g = grid_ind.index
-            cl_g = close_hfq.loc[idx_g]
-            op_g = open_raw.reindex(idx_g)
-            e_g, x_g, s_g = generate_grid_signals(
-                cl_g.values,
-                grid_ind["PolyDevPct"].values,
-                grid_ind["PolyDevTrend"].values,
-                grid_ind["RollingVolPct"].values,
-                grid_ind["PolyBasePred"].values,
-                base_grid_pct=best_g["base_grid_pct"],
-                volatility_scale=best_g["volatility_scale"],
-                trend_sensitivity=best_g["trend_sensitivity"],
-                max_grid_levels=int(best_g["max_grid_levels"]),
-                take_profit_grid=best_g["take_profit_grid"],
-                stop_loss_grid=best_g["stop_loss_grid"],
-                max_holding_days=int(best_g["max_holding_days"]),
-                cooldown_days=int(best_g["cooldown_days"]),
-                min_signal_strength=best_g["min_signal_strength"],
-                position_size=best_g["position_size"],
-                position_sizing_coef=best_g["position_sizing_coef"],
-            )
-            grid_params = {k: best_g[k] for k in GRID_PARAMS_KEYS if k in best_g.index}
-            meta = generate_polyfit_grid_report(
-                df_report, cl_g, e_g, x_g, s_g,
-                params=grid_params, name="Polyfit-Grid",
-                reports_dir=REPORTS_DIR, open_=op_g,
-            )
-            reports_meta.append(meta)
-
-        # ── Polyfit-Switch v3 报告（复用 Polyfit-Grid 的 Grid 参数，确保 Grid-only 一致） ──
-        switch_balanced = all_wf[(all_wf["strategy"] == "Polyfit-Switch") & (all_wf["selector"] == "balanced")]
-        if not switch_balanced.empty and best_grid_params is not None:
-            best_s = switch_balanced.nlargest(1, "test_return").iloc[0]
-            tw_s = best_grid_params["trend_window_days"]
-            vw_s = best_grid_params["vol_window_days"]
-            sw_fast = int(best_s["switch_fast_ma"])
-            sw_slow = int(best_s["switch_slow_ma"])
-            sw_ind = compute_polyfit_switch_indicators(
-                close_hfq, fit_window_days=252,
-                ma_windows=sorted(set([5, 10, 20, 60] + [sw_fast, sw_slow])),
-                trend_window_days=tw_s, vol_window_days=vw_s,
-            )
-            idx_s = sw_ind.index
-            cl_s = close_hfq.loc[idx_s]
-            op_s = open_raw.reindex(idx_s)
-            e_s, x_s, sz_s, modes_s = generate_polyfit_switch_signals(
-                cl_s.values,
-                sw_ind["PolyDevPct"].values,
-                sw_ind["PolyDevTrend"].values,
-                sw_ind["RollingVolPct"].values,
-                sw_ind["PolyBasePred"].values,
-                sw_ind[f"MA{sw_fast}"].values,
-                sw_ind[f"MA{sw_slow}"].values,
-                base_grid_pct=best_grid_params["base_grid_pct"],
-                volatility_scale=best_grid_params["volatility_scale"],
-                trend_sensitivity=best_grid_params["trend_sensitivity"],
-                max_grid_levels=best_grid_params["max_grid_levels"],
-                take_profit_grid=best_grid_params["take_profit_grid"],
-                stop_loss_grid=best_grid_params["stop_loss_grid"],
-                max_holding_days=best_grid_params["max_holding_days"],
-                cooldown_days=best_grid_params["cooldown_days"],
-                min_signal_strength=best_grid_params["min_signal_strength"],
-                position_size=best_grid_params["position_size"],
-                position_sizing_coef=best_grid_params["position_sizing_coef"],
-                switch_deviation_m1=best_s["switch_deviation_m1"],
-                switch_deviation_m2=best_s["switch_deviation_m2"],
-                switch_trailing_stop=best_s["switch_trailing_stop"],
-            )
-            switch_params = {**best_grid_params,
-                             "switch_deviation_m1": best_s["switch_deviation_m1"],
-                             "switch_deviation_m2": best_s["switch_deviation_m2"],
-                             "switch_trailing_stop": best_s["switch_trailing_stop"],
-                             "switch_fast_ma": sw_fast, "switch_slow_ma": sw_slow}
-            meta = generate_polyfit_switch_report(
-                df_report, cl_s, e_s, x_s, sz_s, modes_s,
-                params=switch_params, name="Polyfit-Switch",
-                reports_dir=REPORTS_DIR, open_=op_s,
-            )
-            if meta is not None:
-                reports_meta.append(meta)
-
-        # ── 构建索引页 ──
-        if reports_meta:
-            index_html = build_index_html(reports_meta, REPORTS_DIR)
-            index_path = f"{REPORTS_DIR}/index.html"
-            with open(index_path, "w") as f:
-                f.write(index_html)
-            print(f"\n  Index → {index_path}")
-            print(f"  Open: file://{os.path.abspath(index_path)}")
-
-    print(f"\nDone.")
+    # ── Done ──
+    _dt_total = time.time() - _t0_total
+    print(f"\n{'═' * 70}")
+    print(f"  总耗时: {_dt_total:.0f}s  ({_dt_total/60:.1f}min)")
+    print(f"{'═' * 70}")

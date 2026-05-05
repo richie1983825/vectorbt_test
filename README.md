@@ -4,339 +4,137 @@
 
 标的：512890.SH（中证红利 ETF），后复权数据。
 
-## 最佳历史收益
+## 当前最优策略
 
-### 年度 Walk-Forward（按日历年训练/测试）
+**Polyfit-Switch-v6（OHLCV 增强版 Grid-priority Switch）**，22 月训练 / 12 月测试，步长 3 月，15 个滑动窗口。
 
-| 策略 | 训练期 | 平均 OOS 收益 | 平均 BH 收益 | 超额 α | Sharpe | 正收益窗口 | 跑赢 BH |
-|------|--------|-------------|-------------|--------|--------|-----------|--------|
-| **Polyfit-Switch** | 2 年 | **+20.5%** | +8.5% | +12.0% | 1.86 | 100% | 100% |
-| **Polyfit-Switch** | 3 年 | **+15.1%** | +10.3% | +4.8% | 1.73 | 100% | 75% |
-| MA Grid | 3 年 | +9.3% | +10.3% | -1.0% | 1.64 | 75% | 75% |
-| MA-Switch | 2 年 | +0.7% | +8.5% | -7.8% | 0.29 | 60% | 20% |
-
-### 月度 Walk-Forward（按月滑动训练/测试，更严格）
-
-训练窗口从 12 到 36 月逐月扫描，每窗口三种评分方法对比（return/balanced/robust）。
-
-| 策略 | 评分方法 | 训练期 | 平均 OOS 收益 | 平均 BH 收益 | 超额 α | Sharpe | 正收益窗口 | 跑赢 BH | 窗口数 |
-|------|---------|--------|-------------|-------------|--------|--------|-----------|--------|-------|
-| **Polyfit-Switch** | **balanced** | **22 月** | **+18.4%** | +10.6% | **+7.8%** | 1.55 | 100% | 80% | 15 |
-| Polyfit-Switch | return | 22 月 | +17.3% | +10.6% | +6.7% | 1.40 | 100% | 80% | 15 |
-| Polyfit-Switch | balanced | 跨长度平均 | +14.2% | — | +3.3% | 1.24 | 92% | 63% | 327 |
-| Polyfit-Switch | return | 跨长度平均 | +13.8% | — | +2.9% | 1.22 | 93% | 59% | 327 |
-
-**结论：22 月训练 + balanced 评分是最优组合。** 月度验证确认了原 2 年（24 月）训练的结论，且 balanced 评分通过 20% 回撤惩罚有效抑制选择偏差，比纯 return 选取在 α 上高 0.4%。
-
-**最佳单窗口：2024 年 +49.9%（Polyfit-Switch，2 年训练）。**  
-**全量参数扫描：77,760 组 Grid × 9 组 Indicator × Stage 2 Switch，GPU 单窗口 ≈ 10s。**
-
-### 最佳窗口参数（2024 +49.9%）
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `fit_window_days` | 252 | 1 年线性回归窗口 |
-| `trend_window_days` | 10 | 偏离趋势 EMA |
-| `vol_window_days` | 10 | 波动率窗口 |
-| `base_grid_pct` | 1.5% | 基础网格步长 |
-| `volatility_scale` | 0.5 | 波动率放大系数 |
-| `trend_sensitivity` | 10.0 | 趋势敏感度 |
-| `max_grid_levels` | 2 | 最大网格层级 |
-| `take_profit_grid` | 1.0 | 止盈网格倍数 |
-| `stop_loss_grid` | 1.6 | 止损网格倍数 |
-| `min_signal_strength` | 0.30 | 最小信号强度 |
-| `position_size` | 0.99 | 最大仓位（99%） |
-| `position_sizing_coef` | 60.0 | 仓位系数 |
-| `flat_wait_days` | 5 | Switch 激活等待天数 |
-| `switch_deviation_m1` | 0.02 | Switch 激活偏离阈值 |
-| `switch_deviation_m2` | 0.005 | Switch 关闭偏离阈值 |
-| `switch_trailing_stop` | 0.02 | 追踪止损回撤 2% |
-| `switch_fast_ma` | 5 | 金叉快均线 |
-| `switch_slow_ma` | 60 | 金叉慢均线 |
-
-### 各窗口最优参数（2 年训练）
-
-### Polyfit-Switch 各窗口明细（2 年训练）
-
-| 测试年 | 收益 | BH 收益 | 超额 α | Sharpe | 交易次数 | 胜率 |
-|--------|------|--------|--------|--------|---------|------|
-| 2022 | +29.2% | +1.1% | +28.1% | — | — | — |
-| 2023 | +12.1% | +11.2% | +0.9% | — | — | — |
-| **2024** | **+49.9%** | +21.5% | +28.4% | — | — | — |
-| 2025 | +8.1% | +6.8% | +1.3% | — | — | — |
-| 2026 (YTD) | +3.2% | +1.9% | +1.4% | — | — | — |
-
-#### 各窗口参数详情
-
-| 窗口 | bgp | vs | ts | mgl | tpg | slg | sz | coef | mss | fw | m1 | m2 | tr | ma |
-|------|-----|----|----|-----|-----|-----|-----|------|-----|-----|-----|-----|-----|-----|
-| 2022 +29.2% | 0.008 | 0.0 | 10 | 3 | 1.00 | 1.2 | 0.99 | 60 | 0.30 | 5 | 0.020 | 0.015 | 0.03 | 5/10 |
-| 2023 +12.1% | 0.010 | 2.0 | 4 | 3 | 0.60 | 1.2 | 0.99 | 60 | 0.30 | 5 | 0.030 | 0.020 | 0.02 | 5/10 |
-| **2024 +49.9%** | 0.015 | 0.5 | 10 | 2 | 1.00 | 1.6 | 0.99 | 60 | 0.30 | 5 | 0.020 | 0.005 | 0.02 | 5/60 |
-| 2025 +8.1% | 0.015 | 2.0 | 10 | 4 | 1.00 | 2.0 | 0.99 | 20 | 0.30 | 5 | 0.040 | 0.005 | 0.02 | 5/20 |
-| 2026 +3.2% | 0.012 | 2.0 | 10 | 2 | 0.80 | 1.2 | 0.99 | 60 | 0.30 | 5 | 0.040 | 0.005 | 0.02 | 5/10 |
-
-> 缩写：bgp=base_grid_pct, vs=volatility_scale, ts=trend_sensitivity, mgl=max_grid_levels,
-> tpg=take_profit_grid, slg=stop_loss_grid, sz=position_size, coef=position_sizing_coef,
-> mss=min_signal_strength, fw=flat_wait_days, m1=switch_deviation_m1, m2=switch_deviation_m2,
-> tr=switch_trailing_stop, ma=switch_fast_ma/switch_slow_ma, tw=trend_window_days, vw=vol_window_days
-
-### 22 月训练 + balanced 评分 — 各窗口明细（15 个滑动窗口，step=3 月）
-
-**平均 OOS +18.4%，α +7.8%，100% 窗口正收益，80% 跑赢 BH。**
-
-| 测试期 | 收益 | BH 收益 | 超额 α | Sharpe | 最大回撤 | 交易 | 胜率 |
-|--------|------|--------|--------|--------|----------|------|------|
-| 2021-11→2022-10 | +17.8% | +1.3% | +16.5% | 1.33 | -6.7% | 50 | 50% |
-| 2022-02→2023-01 | +5.4% | +4.1% | +1.3% | 0.52 | -13.8% | 42 | 45% |
-| 2022-05→2023-04 | +23.9% | +15.2% | +8.6% | 2.06 | -9.1% | 29 | 41% |
-| 2022-08→2023-07 | +23.9% | +18.6% | +5.3% | 2.07 | -10.4% | 13 | 46% |
-| 2022-11→2023-10 | +14.5% | +18.2% | -3.7% | 1.36 | -10.4% | 10 | 60% |
-| 2023-02→2024-01 | +29.0% | +12.6% | +16.4% | 2.73 | -6.6% | 49 | 55% |
-| 2023-05→2024-04 | +7.2% | +5.2% | +2.0% | 0.73 | -10.1% | 10 | 40% |
-| 2023-08→2024-07 | +14.4% | +5.7% | +8.8% | 1.92 | -3.8% | 53 | 45% |
-| 2023-11→2024-10 | +31.0% | +15.2% | +15.8% | 1.83 | -10.9% | 17 | 41% |
-| **2024-02→2025-01** | **+39.3%** | +16.0% | **+23.4%** | 2.34 | -7.5% | 26 | 38% |
-| 2024-05→2025-04 | +14.7% | +5.9% | +8.8% | 1.04 | -12.7% | 20 | 35% |
-| 2024-08→2025-07 | +33.5% | +15.1% | +18.4% | 2.21 | -8.6% | 26 | 42% |
-| 2024-11→2025-10 | +5.6% | +10.4% | -4.8% | 0.73 | -6.4% | 9 | 44% |
-| 2025-02→2026-01 | +13.3% | +8.4% | +4.8% | 1.90 | -7.5% | 10 | 50% |
-| 2025-05→2026-04 | +3.2% | +7.8% | -4.6% | 0.50 | -7.8% | 35 | 46% |
-
-> 最佳窗口 2024-02→2025-01 (+39.3%) 对应 2024 年牛市主升浪。仅 3/15 窗口 α 为负。
-
-#### 最佳窗口参数（2024-02→2025-01，+39.3%，22m balanced）
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `fit_window_days` | 252 | 1 年线性回归窗口 |
-| `trend_window_days` | 10 | 偏离趋势 EMA |
-| `vol_window_days` | 20 | 波动率窗口 |
-| `base_grid_pct` | 0.8% | 基础网格步长 |
-| `volatility_scale` | 1.5 | 波动率放大系数 |
-| `trend_sensitivity` | 10.0 | 趋势敏感度 |
-| `max_grid_levels` | 3 | 最大网格层级 |
-| `take_profit_grid` | 0.8 | 止盈网格倍数 |
-| `stop_loss_grid` | 1.6 | 止损网格倍数 |
-| `min_signal_strength` | 0.30 | 最小信号强度 |
-| `position_size` | 0.99 | 最大仓位（99%） |
-| `position_sizing_coef` | 60.0 | 仓位系数 |
-| `flat_wait_days` | 8 | Switch 激活等待天数 |
-| `switch_deviation_m1` | 0.03 | Switch 激活偏离阈值 |
-| `switch_deviation_m2` | 0.015 | Switch 关闭偏离阈值 |
-| `switch_trailing_stop` | 0.03 | 追踪止损回撤 3% |
-| `switch_fast_ma` | 5 | 金叉快均线 |
-| `switch_slow_ma` | 60 | 金叉慢均线 |
-
-### 24 月训练 + balanced 评分 — 各窗口明细（14 个滑动窗口，step=3 月）
-
-**平均 OOS +18.0%，α +8.1%，100% 窗口正收益，71% 跑赢 BH。**
-
-| 测试期 | 收益 | BH 收益 | 超额 α | Sharpe | 最大回撤 | 交易 | 胜率 |
-|--------|------|--------|--------|--------|----------|------|------|
-| **2024-01→2024-12** | **+49.9%** | +21.5% | **+28.4%** | 2.62 | -6.1% | 21 | 52% |
-| 2024-04→2025-03 | +39.7% | +9.6% | +30.1% | 2.37 | -8.1% | 26 | 42% |
-| 2022-01→2022-12 | +29.2% | +1.1% | +28.1% | 2.07 | -6.7% | 45 | 51% |
-| 2023-04→2024-03 | +20.4% | +13.3% | +7.1% | 2.02 | -8.2% | 54 | 44% |
-| 2022-07→2023-06 | +16.9% | +7.4% | +9.4% | 1.54 | -11.9% | 30 | 43% |
-| 2024-07→2025-06 | +12.5% | +10.0% | +2.4% | 0.90 | -9.4% | 21 | 38% |
-| 2022-10→2023-09 | +11.8% | +13.1% | -1.2% | 1.10 | -10.4% | 12 | 58% |
-| 2023-10→2024-09 | +11.6% | +18.8% | -7.2% | 1.30 | -7.3% | 63 | 38% |
-| 2025-04→2026-03 | +11.4% | +7.4% | +3.9% | 1.52 | -7.5% | 9 | 44% |
-| 2025-01→2025-12 | +11.2% | +6.8% | +4.3% | 2.04 | -5.8% | 11 | 55% |
-| 2023-01→2023-12 | +11.0% | +11.2% | -0.2% | 1.21 | -9.3% | 47 | 38% |
-| 2023-07→2024-06 | +10.8% | +14.9% | -4.0% | 1.02 | -6.5% | 7 | 57% |
-| 2024-10→2025-09 | +9.2% | -0.3% | +9.5% | 1.25 | -6.7% | 19 | 42% |
-| 2022-04→2023-03 | +6.4% | +3.7% | +2.7% | 0.64 | -9.3% | 36 | 39% |
-
-> 最佳窗口 2024-01→2024-12 (+49.9%) 与 2 年训练的日历年窗口重合。α 为负的窗口 4/14 (29%)，高于 22m 的 3/15 (20%)——24m 在市场切换期更容易选到过拟合参数。
-
-### 22m vs 24m 评分方法对比（同窗口集，仅评分方法不同）
-
-| 训练 | 评分方法 | OOS | α | BH | Sharpe | Max DD | 正收益 | >BH | 窗口 | 交易 |
-|------|---------|-----|---|-----|--------|--------|--------|-----|------|------|
-| 22m | return | +17.6% | +7.0% | +10.6% | 1.558 | -8.8% | 100% | 80% | 15 | 26 |
-| **22m** | **balanced** | **+18.4%** | **+7.8%** | +10.6% | 1.552 | -8.8% | 100% | 80% | 15 | 27 |
-| 22m | robust | +18.4% | +7.8% | +10.6% | 1.552 | -8.8% | 100% | 80% | 15 | 27 |
-| 24m | return | +17.5% | +7.6% | +9.9% | 1.539 | -8.1% | 100% | 86% | 14 | 28 |
-| 24m | balanced | +18.0% | +8.1% | +9.9% | 1.544 | -8.1% | 100% | 71% | 14 | 29 |
-| 24m | robust | +18.0% | +8.1% | +9.9% | 1.544 | -8.1% | 100% | 71% | 14 | 29 |
-
-**结论：22m + balanced 综合最优。** OOS +18.4% 最高，>BH 80% 比 24m 的 71% 更稳定。balanced 在两种训练长度下都优于 return。
-24m 虽然 α 略高 (+8.1% vs +7.8%)，但跑赢 BH 的一致性明显下降 (71% vs 80%)，说明更长训练窗口引入了过度优化。
-
-### 评分方法对比结论（跨 13-36 月训练）
-
-| 评分方法 | 平均 OOS | 平均 α | Sharpe | 跑赢 BH | 训练收益 | 特征 |
-|---------|---------|--------|--------|--------|---------|------|
-| **balanced** | **+14.2%** | **+3.3%** | 1.24 | 63% | +15.9% | 收益+Sharpe+回撤三维均衡，最稳定 |
-| return | +13.8% | +2.9% | 1.22 | 59% | +17.2% | 纯收益最大化，训练收益高但 OOS 反低 |
-| robust | +14.2% | +3.3% | 1.24 | 63% | +15.9% | 当前 fallback 到 balanced（无子段数据），结果一致 |
-
-### 所有策略整体对比
+### 六组合 WF OOS 对比
 
 ```
-Polyfit-Switch  2yr  OOS=+20.5%  BH=+8.5%  α=+12.0%  sharpe=1.856  pos=100%  >BH=100%  w=5  tr=28
-Polyfit-Switch  3yr  OOS=+15.1%  BH=+10.3%  α=+4.8%  sharpe=1.725  pos=100%  >BH=75%   w=4  tr=14
-MA              3yr  OOS=+9.3%   BH=+10.3%  α=-1.1%  sharpe=1.643  pos=75%   >BH=75%   w=4  tr=12
-MA-Switch       3yr  OOS=-2.4%   BH=+10.3%  α=-12.8% sharpe=-0.076 pos=75%   >BH=0%    w=4  tr=19
+  # 组合                            OOS        α   Sharpe   maxDD  pos%   >BH
+  1 Grid-return                   +18.3%    +7.7%    1.697    -7.2%  93%  73%
+  2 Grid-balanced                 +11.6%    +1.0%    1.434    -6.5%  87%  60%
+  3 Switch-return ★              +22.2%   +11.5%    1.945    -7.4% 100%  87%
+  4 Switch-balanced               +14.6%    +4.0%    1.581    -8.0%  87%  60%
+  5 Grid-ret+Switch-bal           +22.2%   +11.5%    1.945    -7.4% 100%  87%
+  6 Grid-bal+Switch-ret           +14.6%    +4.0%    1.581    -8.0%  87%  60%
 ```
+
+**最优：Switch-return / Grid-ret+Switch-bal（并列），OOS +22.2%，Sharpe 1.945，87% 窗口跑赢 BH。**
 
 ---
 
-## Polyfit-Switch 策略详解
+## Polyfit-Grid 策略
 
-### 核心思想
+纯 Grid 均值回复网格策略，不含 Switch。基线为滑动窗口线性回归（252 天固定）。
 
-用**滑动窗口线性回归**替代简单移动均线作为价格基准线，结合**双模式切换**机制：
+### 最优参数
 
-- **Grid 模式（均值回复）**：在基线下方挂多单网格，偏离越大仓位越重，回归到止盈线离场
-- **Switch 模式（趋势追踪）**：价格持续在基线上方且偏离较大时激活，用快慢均线金叉入场 + **最高价回撤追踪止损**离场
+| 参数 | return | balanced | 说明 |
+|------|--------|----------|------|
+| OOS 均值 | +18.3% | +11.6% | 15 窗口 WF |
+| Sharpe | 1.697 | 1.434 | |
+| maxDD | -7.2% | -6.5% | |
+| `trend_window_days` | 10 | 10 | 偏离趋势 EMA |
+| `vol_window_days` | 10 | 10 | 波动率窗口 |
+| `base_grid_pct` | 1.0% | 0.8% | 基础网格步长 |
+| `volatility_scale` | 0.0 | 0.0 | 波动率放大系数 |
+| `trend_sensitivity` | 4.0 | 8.0 | 趋势敏感度 |
+| `max_grid_levels` | 3 | 3 | 最大网格层级 |
+| `take_profit_grid` | 0.80 | 1.00 | 止盈网格倍数 |
+| `stop_loss_grid` | 1.60 | 1.20 | 止损网格倍数 |
+| `max_holding_days` | 45 | 45 | 最大持仓 |
+| `cooldown_days` | 1 | 1 | 出场冷却 |
+| `min_signal_strength` | 0.30 | 0.30 | 最小信号强度 |
+| `position_size` | 0.99 | 0.99 | 最大仓位 |
+| `position_sizing_coef` | 60.0 | 60.0 | 仓位系数 |
 
-### 指标计算
+> return 评分倾向更宽的网格步长和更高的止损容忍，牺牲回撤换收益。
+> balanced 评分综合考量收益+Sharpe+回撤，网格更密、止盈更早、止损更紧。
 
-```
-1. PolyBasePred（基线）
-   对前 252 根 bar（约 1 年）的收盘价做最小二乘拟合 y = α + βx
-   取拟合线在当天的预测值作为基线。比 SMA 更能反映价格长期运行中枢。
+**全量回测**（最优 return 参数）：总收益 +167%，α +55%，Sharpe 1.66，maxDD -9.1%，135 笔交易。
 
-2. PolyDevPct（偏离度）
-   PolyDevPct = close / PolyBasePred - 1
-   正值 = 价格高于基线，负值 = 价格低于基线
+---
 
-3. PolyDevTrend（偏离趋势）
-   PolyDevTrend = EMA(diff(PolyDevPct), span=trend_window_days)
-   正值 → 偏离在扩大（价格在向基线回归）
-   负值 → 偏离在收敛（价格在继续远离基线）
+## Polyfit-Switch-v6 策略
 
-4. RollingVolPct（滚动波动率）
-   日收益率的滚动总体标准差（ddof=0），用于动态调整网格宽度
-```
+OHLCV 增强版 Grid-priority Switch。在 Grid 基础上，Grid 空仓时 Switch 可入场。
 
-### 信号生成（逐 bar 状态机）
+### v6 增强因子（vs v5）
 
-#### Grid 模式入场
+**入场 OHLCV 过滤**（基于 109 笔 Switch 统计分析）：
 
-```
-条件：无持仓 且 cooldown == 0
-  信号强度 = |PolyDevPct| / dynamic_grid_step
-  入场等级 = clip(floor(信号强度), 1, max_grid_levels)
-  入场阈值 = -入场等级 × dynamic_grid_step
+| # | 条件 | 统计依据 |
+|---|------|----------|
+| 1 | 微涨 0 ~ +0.5% → 不买 | 胜率 12.5% |
+| 2 | 长上影 ≥30% → 不买 | 胜率 18.4% |
+| 3 | 正常量能 0.8-1.5x → 不买 | 胜率 13.7% |
+| 4 | 阳线 + 连涨<4天 → 不买 | 阳线胜率 23.8% |
+| 5 | 高位 ≥70% + 连涨<4天 → 不买 | 高位胜率 32.1% |
 
-  当 PolyDevPct ≤ 入场阈值 且 信号强度 ≥ min_signal_strength：
-    仓位 = clip(|PolyDevPct| × (1 + max(RollingVolPct, 0)) × position_sizing_coef,
-                0, position_size)
-    入场
-```
+**离场改进**：
+- dp 连续下跌 1 天即离场（原 3 天）
+- dp < -0.5% 预警离场（避免被 Grid 强制踢出，grid_force 胜率 0%）
+- ATR 追踪乘数 1.5（原 2.5）
 
-#### Grid 模式离场
+### 最优参数
 
-```
-持仓中，任一条件触发即离场：
-  1. 持仓天数 ≥ max_holding_days（45 天）
-  2. PolyDevPct ≥ 入场等级 × ref_step × take_profit_grid（止盈）
-  3. PolyDevPct ≤ -入场等级 × ref_step × stop_loss_grid（止损）
-```
+| 参数 | return | balanced | 说明 |
+|------|--------|----------|------|
+| OOS 均值 | +22.2% | +14.6% | 15 窗口 WF |
+| Sharpe | 1.945 | 1.581 | |
+| maxDD | -7.4% | -8.0% | |
+| `trend_entry_dp` | 0.0 | 0.0 | Switch 入场偏离阈值 |
+| `trend_confirm_dp_slope` | 0.0 | 0.0 | 趋势确认斜率 |
+| `trend_atr_mult` | 1.5 | 1.5 | ATR 追踪乘数 |
+| `trend_decline_days` | 1 | 1 | dp 连续下跌离场天数 |
+| `trend_vol_climax` | 2.5 | 2.5 | 量能衰竭阈值 |
+| `enable_ohlcv_filter` | True | True | OHLCV 入场过滤 |
+| `enable_early_exit` | True | True | 预警离场 |
+| Grid 参数 | 同 Grid-return | 同 Grid-balanced | |
 
-#### Switch 模式激活/关闭
+> Switch 最优参数高度一致：ATR=1.5、decline=1 天、OHLCV/early_exit 全开，说明这些因子稳定。
 
-```
-激活（三条件同时满足）：
-  1. flat_days ≥ flat_wait_days（连续空仓天数达标）
-  2. close > PolyBasePred（价格在基线上方）
-  3. PolyDevPct > switch_deviation_m1（偏离超过激活阈值）
+**全量回测**（最优 return 参数）：Grid+Switch 合并 +254%，纯 Grid +167%，纯 Switch +30%，53 笔 Switch 交易。
 
-关闭：
-  PolyDevPct < switch_deviation_m2（偏离回落到关闭阈值以下）
-```
+---
 
-#### Switch 模式交易（★ 追踪止损）
-
-```
-入场：fast_ma > slow_ma（金叉）+ 无持仓 → 全仓买入
-出：持仓期间持续追踪最高收盘价 peak_close
-    当 close ≤ peak_close × (1 - switch_trailing_stop) 时离场
-
-追踪止损 vs 死叉离场的优势：
-  - 死叉容易被短期均线缠绕反复触发进出
-  - 追踪止损只在价格从最高点回撤足够多时离场，持仓更稳
-  - 实际测试：2024 年 +49.6%（追踪止损）vs +39.8%（死叉）
-```
-
-#### 动态网格步长
-
-```
-dynamic_grid_step = base_grid_pct
-                  × (1 + trend_sensitivity × |PolyDevTrend|)
-                  × (1 + volatility_scale × max(RollingVolPct, 0))
-下限 = base_grid_pct × 0.3
-```
-
-高波动 / 强趋势 → 宽网格 → 更严格的入场条件，减少假信号。
-
-### 执行模型
+## 执行模型
 
 所有策略使用 **次日开盘价成交**，消除前视偏差：
 
 ```
-bar i Close 数据到达 → 计算指标 → 生成 entry/exit 信号
-    ↓
-bar i+1 Open 成交（fill_price = open.shift(-1)）
-    ↓
-NAV 仍以 bar i Close 估值
+bar i Close → 计算指标 → 生成信号 → bar i+1 Open 成交
 ```
 
-### 参数说明
+GPU kernel 分离 fill_price（成交价）和 close（NAV 估值价）。
 
-| 参数 | 含义 | 扫描范围 |
-|------|------|---------|
-| `fit_window_days` | 线性回归拟合窗口 | 252（固定） |
-| `trend_window_days` | 偏离趋势 EMA 窗口 | 10-20 |
-| `vol_window_days` | 波动率计算窗口 | 10-30 |
-| `base_grid_pct` | 基础网格步长 | 0.8%-1.5% |
-| `volatility_scale` | 波动率放大系数 | 0.0-2.0 |
-| `trend_sensitivity` | 趋势敏感度 | 4.0-10.0 |
-| `max_grid_levels` | 最大网格层级 | 2-4 |
-| `take_profit_grid` | 止盈网格倍数 | 0.6-1.0 |
-| `stop_loss_grid` | 止损网格倍数 | 1.2-2.0 |
-| `max_holding_days` | 最大持仓天数 | 45（固定） |
-| `cooldown_days` | 出场后冷却天数 | 1（固定） |
-| `min_signal_strength` | 最小信号强度 | 0.30-0.60 |
-| `position_size` | 最大仓位比例 | 0.92-0.99 |
-| `position_sizing_coef` | 仓位系数 | 20-60 |
-| `flat_wait_days` | Switch 激活等待天数 | 5-15 |
-| `switch_deviation_m1` | Switch 激活偏离阈值 | 2%-5% |
-| `switch_deviation_m2` | Switch 关闭偏离阈值 | 0.5%-2% |
-| `switch_trailing_stop` | Switch 追踪止损回撤比例 | 2%-10% |
-| `switch_fast_ma` | Switch 快均线周期 | 5-20 |
-| `switch_slow_ma` | Switch 慢均线周期 | 10-60 |
+---
 
-### 扫描策略
-
-采用**两阶段 GPU 批量扫描**，避免参数爆炸：
-
-- **Stage 1**（GPU）：固定 Switch 参数为典型值，从 77,760 组 grid 参数中随机采样 2000 组，GPU 批量生成信号 + 批量回测
-- **Stage 2**（GPU）：固定最优 Grid 参数，全排列扫描 Switch 参数（约 2000 组合），GPU 批量完成
-
-## 工程结构
+## 架构
 
 ```
 vectorbt_test/
-├── main.py                      # 主入口，Walk-Forward 分析
+├── main.py                         # 入口：调用 workflows，输出六组合对比 + HTML 报告
+├── workflows/
+│   ├── polyfit_grid.py             # Grid WF + GPU 扫描 + 参数缓存
+│   │   └── reports/grid_wf_cache.csv  (最优 Grid 参数，return/balanced/robust)
+│   └── polyfit_switch.py           # Switch-v6 WF + CPU 扫描（依赖 Grid 缓存）
 ├── strategies/
-│   ├── ma_grid.py               # MA 网格策略（CPU + GPU）
-│   ├── ma_switch.py             # MA-Switch 双模式策略（CPU + GPU）
-│   └── polyfit_switch.py        # Polyfit-Switch 双模式策略（CPU + GPU）★ 最佳
+│   ├── polyfit_grid.py             # Grid 策略 + GPU 批量扫描
+│   └── polyfit_switch.py           # Switch-v6 OHLCV 增强策略 (CPU + GPU kernel)
 ├── utils/
-│   ├── backtest.py              # 回测引擎（VectorBT CPU + CuPy GPU）
-│   ├── data.py                  # 数据加载
-│   ├── gpu.py                   # GPU/CUDA 检测
-│   ├── indicators.py            # 技术指标计算（MA / Polyfit）
-│   ├── reports.py               # 报告生成（VectorBT HTML 图表）
-│   ├── scan.py                  # 参数扫描通用框架
-│   └── walkforward.py           # Walk-Forward 窗口生成与分析
-└── data/
-    └── 512890.SH_hfq.parquet    # 后复权行情数据
+│   ├── backtest.py                 # 回测引擎（VectorBT CPU + CuPy GPU batch）
+│   ├── data.py                     # 数据加载
+│   ├── gpu.py                      # GPU/CUDA 检测
+│   ├── indicators.py               # 技术指标（Polyfit / MA）
+│   ├── reports.py                  # HTML 报告生成
+│   ├── scoring.py                  # 参数评分（return/balanced/robust）
+│   └── walkforward.py              # Walk-Forward 窗口生成
+└── reports/                        # 输出目录
+    ├── grid_wf_cache.csv           # Grid 参数缓存
+    ├── wf_comparison.csv           # 六组合 WF 结果
+    └── index.html                  # HTML 报告索引
 ```
 
 ## 运行
@@ -345,12 +143,40 @@ vectorbt_test/
 uv run python main.py
 ```
 
-输出：
-- `reports/walkforward_results.csv` — 所有窗口的训练/测试结果
-- `reports/MA/` / `reports/MA-Switch/` / `reports/Polyfit-Switch/` — 最优参数 VectorBT 报告
-- `reports/index.html` — 汇总索引页面
+流程：
+1. Stage 1 — Grid WF：`reports/grid_wf_cache.csv` 存在则跳过 GPU 扫描（秒级），否则逐窗口扫描（~3 分钟/15 窗口）
+2. Stage 2 — Switch-v6 WF：逐窗口 CPU 扫描 162 组 Switch 参数（~1.5 分钟/15 窗口）
+3. 输出六组合对比 + HTML 报告
 
+总耗时：首次 ~5 分钟，后续 ~1.5 分钟（Grid 缓存命中）。
 
+### 单独运行
 
-## 测试
-1. 510880，不适合，因为部分股票波动率较大，又是周期型，导致ETF的趋势特征明显
+```bash
+uv run python workflows/polyfit_grid.py      # 仅 Grid WF + 更新缓存
+uv run python workflows/polyfit_switch.py    # Grid + Switch-v6 WF
+```
+
+## 分析脚本
+
+| 脚本 | 用途 |
+|------|------|
+| `analyze_down_day_filter.py` | Switch 下一天过滤效果分析 |
+| `analyze_switch_surge.py` | Switch 入场 OHLCV 特征分析（连续上涨/单日急涨） |
+| `compare_v5_v6.py` | v5 vs v6 固定参数对比 |
+| `grid_vs_switch_v6.py` | Grid vs Switch-v6 WF 参数扫描对比 |
+
+## 评分方法
+
+| 方法 | 逻辑 | 适用场景 |
+|------|------|----------|
+| `return` | 训练期总收益最高 | 趋势明显、回撤容忍度高 |
+| `balanced` | 收益(50%)+Sharpe(30%)-回撤(20%) | 均衡风险收益 |
+| `robust` | 要求各训练子段均正收益，再选最高 Sharpe | 稳健性优先（当前 fallback 到 balanced） |
+
+## 重要约束
+
+- `fit_window_days` 必须固定为 252。放开扫描会导致训练期严重过拟合
+- 禁止 ML 策略（XGBoost/神经网络）：数据量仅 1763 条日线，ML 极小样本必然过拟合
+- 所有回测默认 Walk-Forward，禁止全量数据扫描后报告收益
+- 每次回测必须同时列出 return/balanced/robust 三种评分结果

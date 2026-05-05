@@ -251,8 +251,10 @@ def generate_polyfit_switch_report(
     df, close, entries, exits, sizes, entry_modes,
     params, name="Polyfit-Switch", reports_dir="reports",
     open_=None,
+    pf_grid=None,     # Grid 独立 Portfolio（独立仓位模式）
+    pf_switch=None,   # Switch 独立 Portfolio（独立仓位模式）
 ):
-    """Polyfit-Switch 增强报告：K线+基线+Full vs Grid-only 模式对比。"""
+    """Polyfit-Switch 增强报告：独立仓位 Grid/Switch 收益曲线对比。"""
     import plotly.graph_objects as go
 
     idx = close.index
@@ -262,46 +264,81 @@ def generate_polyfit_switch_report(
     out_dir = f"{reports_dir}/{safe_name}"
     os.makedirs(out_dir, exist_ok=True)
 
-    pf = vbt.Portfolio.from_signals(
-        fill_price,
-        entries=pd.Series(entries, index=idx),
-        exits=pd.Series(exits, index=idx),
-        size=pd.Series(sizes, index=idx),
-        size_type="percent", init_cash=100_000.0, freq="D",
-    )
+    independent_mode = pf_grid is not None and pf_switch is not None
 
-    e_grid = entries.copy()
-    e_grid[entry_modes == 2] = False
-    pf_grid = vbt.Portfolio.from_signals(
-        fill_price,
-        entries=pd.Series(e_grid, index=idx),
-        exits=pd.Series(exits, index=idx),
-        size=pd.Series(sizes, index=idx),
-        size_type="percent", init_cash=100_000.0, freq="D",
-    )
+    if independent_mode:
+        pf = vbt.Portfolio.from_signals(
+            fill_price,
+            entries=pd.Series(entries, index=idx),
+            exits=pd.Series(exits, index=idx),
+            size=pd.Series(sizes, index=idx),
+            size_type="percent", init_cash=1.0, freq="D",
+        )
 
-    full_ret = pf.total_return()
-    grid_ret = pf_grid.total_return()
-    bh_ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
-    switch_marginal = full_ret - grid_ret
-    grid_trades = int((entry_modes == 1).sum())
-    switch_trades = int((entry_modes == 2).sum())
+        grid_ret = pf_grid.total_return()
+        switch_ret = pf_switch.total_return()
+        full_ret = pf.total_return()
+        bh_ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
 
-    print(f"\n  {'='*60}")
-    print(f"  {name} — Full vs Grid-only 模式分析")
-    print(f"  {'='*60}")
-    print(f"  BH return:              {bh_ret:+.2%}")
-    print(f"  Full (Grid+Switch):     {full_ret:+.2%}  (α={full_ret-bh_ret:+.2%})")
-    print(f"  Grid-only:              {grid_ret:+.2%}  (α={grid_ret-bh_ret:+.2%})")
-    print(f"  Switch 边际贡献:         {switch_marginal:+.2%}")
-    print(f"  Grid 交易: {grid_trades}   Switch 交易: {switch_trades}")
-    print(f"  Full MaxDD: {pf.max_drawdown():.2%}  Grid-only MaxDD: {pf_grid.max_drawdown():.2%}")
+        grid_trades = pf_grid.trades.count()
+        switch_trades = pf_switch.trades.count()
 
-    stats = pf.stats()
-    stats["Switch_marginal_return"] = switch_marginal
-    stats["Grid_only_return"] = grid_ret
-    stats["Grid_trades"] = grid_trades
-    stats["Switch_trades"] = switch_trades
+        print(f"\n  {'='*60}")
+        print(f"  {name} — 独立仓位 Grid vs Switch 对比")
+        print(f"  {'='*60}")
+        print(f"  BH return:              {bh_ret:+.2%}")
+        print(f"  Grid (独立):             {grid_ret:+.2%}  (α={grid_ret-bh_ret:+.2%})")
+        print(f"  Switch (独立):           {switch_ret:+.2%}  (α={switch_ret-bh_ret:+.2%})")
+        print(f"  Merged (Grid+Switch):   {full_ret:+.2%}  (α={full_ret-bh_ret:+.2%})")
+        print(f"  Grid 交易: {grid_trades}   Switch 交易: {switch_trades}")
+        print(f"  Grid MaxDD: {pf_grid.max_drawdown():.2%}  Switch MaxDD: {pf_switch.max_drawdown():.2%}")
+
+        stats = pf.stats()
+        stats["Grid_return"] = grid_ret
+        stats["Switch_return"] = switch_ret
+        stats["Grid_trades"] = grid_trades
+        stats["Switch_trades"] = switch_trades
+    else:
+        pf = vbt.Portfolio.from_signals(
+            fill_price,
+            entries=pd.Series(entries, index=idx),
+            exits=pd.Series(exits, index=idx),
+            size=pd.Series(sizes, index=idx),
+            size_type="percent", init_cash=100_000.0, freq="D",
+        )
+
+        e_grid = entries.copy()
+        e_grid[entry_modes == 2] = False
+        pf_grid = vbt.Portfolio.from_signals(
+            fill_price,
+            entries=pd.Series(e_grid, index=idx),
+            exits=pd.Series(exits, index=idx),
+            size=pd.Series(sizes, index=idx),
+            size_type="percent", init_cash=100_000.0, freq="D",
+        )
+
+        full_ret = pf.total_return()
+        grid_ret = pf_grid.total_return()
+        bh_ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
+        switch_marginal = full_ret - grid_ret
+        grid_trades = int((entry_modes == 1).sum())
+        switch_trades = int((entry_modes == 2).sum())
+
+        print(f"\n  {'='*60}")
+        print(f"  {name} — Full vs Grid-only 模式分析")
+        print(f"  {'='*60}")
+        print(f"  BH return:              {bh_ret:+.2%}")
+        print(f"  Full (Grid+Switch):     {full_ret:+.2%}  (α={full_ret-bh_ret:+.2%})")
+        print(f"  Grid-only:              {grid_ret:+.2%}  (α={grid_ret-bh_ret:+.2%})")
+        print(f"  Switch 边际贡献:         {switch_marginal:+.2%}")
+        print(f"  Grid 交易: {grid_trades}   Switch 交易: {switch_trades}")
+        print(f"  Full MaxDD: {pf.max_drawdown():.2%}  Grid-only MaxDD: {pf_grid.max_drawdown():.2%}")
+
+        stats = pf.stats()
+        stats["Switch_marginal_return"] = switch_marginal
+        stats["Grid_only_return"] = grid_ret
+        stats["Grid_trades"] = grid_trades
+        stats["Switch_trades"] = switch_trades
     stats_path = f"{out_dir}/{safe_name}_stats.csv"
     stats.to_csv(stats_path)
     print(f"  Stats -> {stats_path}")
@@ -312,64 +349,108 @@ def generate_polyfit_switch_report(
     try:
         from plotly.subplots import make_subplots
 
-        recs = pf.trades.records_readable
-        trade_returns_pct = []
-        trade_dates = []
-        # 构建 exit_fill_date → {entry info, exit_reason} 映射
-        exit_info_map: dict = {}
-        if len(recs) > 0:
-            for i in range(len(recs)):
-                r = float(recs["Return"].iloc[i])
-                if not pd.notna(recs["Return"].iloc[i]):
-                    continue
-                trade_returns_pct.append(r * 100)
-                ets = recs["Exit Timestamp"].iloc[i]
-                exit_dt = pd.Timestamp(ets) if pd.notna(ets) else idx[-1]
-                trade_dates.append(exit_dt)
-                entry_dt = pd.Timestamp(recs["Entry Timestamp"].iloc[i]) if pd.notna(recs["Entry Timestamp"].iloc[i]) else None
-                entry_px = float(recs["Avg Entry Price"].iloc[i])
-                exit_px = float(recs["Avg Exit Price"].iloc[i])
-
-                # 确定入场模式：在 idx 中找到入场日期对应的 entry_modes
-                emode = 1  # default Grid
-                if entry_dt is not None and entry_dt in idx:
-                    e_pos = idx.get_loc(entry_dt)
-                    if e_pos < len(entry_modes):
-                        emode = int(entry_modes[e_pos])
-
-                # 确定离场原因
-                if emode == 2:  # Switch
-                    if r < 0:
-                        reason = "追踪止损"
-                    else:
-                        reason = "趋势结束"
-                else:  # Grid
+        def _parse_trades_from_pf(pf_obj, mode_label, max_hold=45):
+            """从独立 Portfolio 解析交易记录，返回 (dates, returns_pct, infos)。"""
+            recs = pf_obj.trades.records_readable
+            dates, rets, infos = [], [], []
+            if len(recs) > 0:
+                for i in range(len(recs)):
+                    r = float(recs["Return"].iloc[i])
+                    if not pd.notna(recs["Return"].iloc[i]):
+                        continue
+                    rets.append(r * 100)
+                    ets = recs["Exit Timestamp"].iloc[i]
+                    exit_dt = pd.Timestamp(ets) if pd.notna(ets) else idx[-1]
+                    dates.append(exit_dt)
+                    entry_dt = pd.Timestamp(recs["Entry Timestamp"].iloc[i]) if pd.notna(recs["Entry Timestamp"].iloc[i]) else None
+                    entry_px = float(recs["Avg Entry Price"].iloc[i])
+                    exit_px = float(recs["Avg Exit Price"].iloc[i])
                     hd = (exit_dt - entry_dt).days if entry_dt else 0
-                    if hd >= 45:
-                        reason = "到期平仓"
-                    elif r > 0:
-                        reason = "止盈离场"
+                    if mode_label == "Switch":
+                        reason = "追踪止损" if r < 0 else "趋势结束"
                     else:
-                        reason = "止损离场"
+                        if hd >= max_hold:
+                            reason = "到期平仓"
+                        elif r > 0:
+                            reason = "止盈离场"
+                        else:
+                            reason = "止损离场"
+                    infos.append(dict(
+                        entry_dt=entry_dt, entry_px=entry_px, exit_px=exit_px,
+                        return_pct=r * 100, mode=mode_label, reason=reason,
+                    ))
+            return dates, rets, infos
 
-                exit_info_map[exit_dt] = dict(
-                    entry_dt=entry_dt, entry_px=entry_px, exit_px=exit_px,
-                    return_pct=r * 100, mode=emode, reason=reason,
-                )
+        if independent_mode:
+            grid_trade_dates, grid_trade_returns, grid_trade_infos = \
+                _parse_trades_from_pf(pf_grid, "Grid")
+            sw_trade_dates, sw_trade_returns, sw_trade_infos = \
+                _parse_trades_from_pf(pf_switch, "Switch")
+        else:
+            recs = pf.trades.records_readable
+            trade_returns_pct = []
+            trade_dates = []
+            exit_info_map: dict = {}
+            if len(recs) > 0:
+                for i in range(len(recs)):
+                    r = float(recs["Return"].iloc[i])
+                    if not pd.notna(recs["Return"].iloc[i]):
+                        continue
+                    trade_returns_pct.append(r * 100)
+                    ets = recs["Exit Timestamp"].iloc[i]
+                    exit_dt = pd.Timestamp(ets) if pd.notna(ets) else idx[-1]
+                    trade_dates.append(exit_dt)
+                    entry_dt = pd.Timestamp(recs["Entry Timestamp"].iloc[i]) if pd.notna(recs["Entry Timestamp"].iloc[i]) else None
+                    entry_px = float(recs["Avg Entry Price"].iloc[i])
+                    exit_px = float(recs["Avg Exit Price"].iloc[i])
+                    emode = 1
+                    if entry_dt is not None and entry_dt in idx:
+                        e_pos = idx.get_loc(entry_dt)
+                        if e_pos < len(entry_modes):
+                            emode = int(entry_modes[e_pos])
+                    if emode == 2:
+                        reason = "追踪止损" if r < 0 else "趋势结束"
+                    else:
+                        hd = (exit_dt - entry_dt).days if entry_dt else 0
+                        if hd >= 45:
+                            reason = "到期平仓"
+                        elif r > 0:
+                            reason = "止盈离场"
+                        else:
+                            reason = "止损离场"
+                    exit_info_map[exit_dt] = dict(
+                        entry_dt=entry_dt, entry_px=entry_px, exit_px=exit_px,
+                        return_pct=r * 100, mode=emode, reason=reason,
+                    )
 
-        fig_ov = make_subplots(
-            rows=4, cols=1, shared_xaxes=True,
-            row_heights=[0.45, 0.20, 0.15, 0.20],
-            vertical_spacing=0.03,
-            subplot_titles=(
-                f"{name} - K线 + Polyfit基线",
-                "累积收益 (Full vs Grid-only vs BH)",
-                "持仓仓位",
-                "逐笔交易盈亏 (%)",
-            ),
-        )
+        if independent_mode:
+            fig_ov = make_subplots(
+                rows=6, cols=1, shared_xaxes=True,
+                row_heights=[0.26, 0.16, 0.10, 0.10, 0.15, 0.15],
+                vertical_spacing=0.025,
+                subplot_titles=(
+                    f"{name} - K线 + Polyfit基线",
+                    "累积收益 (Grid vs Switch vs BH)",
+                    "Grid 持仓仓位",
+                    "Switch 持仓仓位",
+                    "Grid 逐笔交易盈亏 (%)",
+                    "Switch 逐笔交易盈亏 (%)",
+                ),
+            )
+        else:
+            fig_ov = make_subplots(
+                rows=4, cols=1, shared_xaxes=True,
+                row_heights=[0.45, 0.20, 0.15, 0.20],
+                vertical_spacing=0.03,
+                subplot_titles=(
+                    f"{name} - K线 + Polyfit基线",
+                    "累积收益 (Full vs Grid-only vs BH)",
+                    "持仓仓位",
+                    "逐笔交易盈亏 (%)",
+                ),
+            )
 
-        # 对齐 df 到 idx，避免 df_report (base_ind) 和 idx_s (switch_ind) 长度不一致
+        # 对齐 df 到 idx
         df_aligned = df.loc[idx]
 
         # Row 1: K线 + 基线 + 买卖标记
@@ -383,6 +464,7 @@ def generate_polyfit_switch_report(
                 x=idx, y=df_aligned["PolyBasePred"], mode="lines",
                 name="Polyfit基线", line=dict(color="#FF9800", width=1.5),
             ), row=1, col=1)
+
         # Row 2: 累积收益
         bh_cum = close / close.iloc[0] - 1
         eq_f = pf.value() / pf.value().iloc[0] - 1
@@ -391,58 +473,129 @@ def generate_polyfit_switch_report(
             x=idx, y=bh_cum, mode="lines", name=f"BH ({bh_ret:+.1%})",
             line=dict(color="gray", width=1, dash="dot"),
         ), row=2, col=1)
-        fig_ov.add_trace(go.Scatter(
-            x=eq_f.index, y=eq_f, mode="lines", name=f"Full ({full_ret:+.1%})",
-            line=dict(color="#2196F3", width=2),
-        ), row=2, col=1)
-        fig_ov.add_trace(go.Scatter(
-            x=eq_g.index, y=eq_g, mode="lines", name=f"Grid-only ({grid_ret:+.1%})",
-            line=dict(color="#4CAF50", width=1.5, dash="dash"),
-        ), row=2, col=1)
 
-        # Row 3: 持仓仓位（Full 策略）
-        pos_series = pf.gross_exposure().reindex(idx).fillna(0)
-        pos_colors = ["#2196F3" if v > 0 else "rgba(0,0,0,0)" for v in pos_series.values]
-        fig_ov.add_trace(go.Bar(
-            x=idx, y=pos_series.values,
-            marker_color=pos_colors, marker_line_width=0,
-            name="持仓",
-        ), row=3, col=1)
+        if independent_mode:
+            eq_s = pf_switch.value() / pf_switch.value().iloc[0] - 1
+            fig_ov.add_trace(go.Scatter(
+                x=eq_g.index, y=eq_g, mode="lines",
+                name=f"Grid 独立仓位 ({grid_ret:+.1%})",
+                line=dict(color="#1a5276", width=2),
+            ), row=2, col=1)
+            fig_ov.add_trace(go.Scatter(
+                x=eq_s.index, y=eq_s, mode="lines",
+                name=f"Switch 独立仓位 ({switch_ret:+.1%})",
+                line=dict(color="#c0392b", width=2),
+            ), row=2, col=1)
+            fig_ov.add_trace(go.Scatter(
+                x=eq_f.index, y=eq_f, mode="lines",
+                name=f"Merged ({full_ret:+.1%})",
+                line=dict(color="#2196F3", width=1, dash="dot"),
+            ), row=2, col=1)
+        else:
+            fig_ov.add_trace(go.Scatter(
+                x=eq_f.index, y=eq_f, mode="lines", name=f"Full ({full_ret:+.1%})",
+                line=dict(color="#2196F3", width=2),
+            ), row=2, col=1)
+            fig_ov.add_trace(go.Scatter(
+                x=eq_g.index, y=eq_g, mode="lines", name=f"Grid-only ({grid_ret:+.1%})",
+                line=dict(color="#4CAF50", width=1.5, dash="dash"),
+            ), row=2, col=1)
 
-        # Row 4: 逐笔交易盈亏（含买卖明细）
-        if trade_returns_pct:
-            colors = ["#4CAF50" if r > 0 else "#F44336" for r in trade_returns_pct]
-            pnl_texts = []
-            for td in trade_dates:
-                info = exit_info_map.get(td)
-                if info is not None:
-                    md_label = "Switch" if info["mode"] == 2 else "Grid"
-                    pnl_texts.append(
-                        f"{info['reason']}({md_label})<br>"
+        # Row 3-4: 持仓仓位 (independent: row3=Grid, row4=Switch)
+        if independent_mode:
+            pos_grid = pf_grid.gross_exposure().reindex(idx).fillna(0)
+            pos_switch = pf_switch.gross_exposure().reindex(idx).fillna(0)
+            fig_ov.add_trace(go.Bar(
+                x=idx, y=pos_grid.values,
+                marker_color="#1a5276", marker_line_width=0,
+                name="Grid 持仓",
+            ), row=3, col=1)
+            fig_ov.add_trace(go.Bar(
+                x=idx, y=pos_switch.values,
+                marker_color="#c0392b", marker_line_width=0,
+                name="Switch 持仓",
+            ), row=4, col=1)
+        else:
+            pos_series = pf.gross_exposure().reindex(idx).fillna(0)
+            pos_colors = ["#2196F3" if v > 0 else "rgba(0,0,0,0)" for v in pos_series.values]
+            fig_ov.add_trace(go.Bar(
+                x=idx, y=pos_series.values,
+                marker_color=pos_colors, marker_line_width=0,
+                name="持仓",
+            ), row=3, col=1)
+
+        # Row 5-6: 逐笔交易盈亏 (independent: row5=Grid, row6=Switch)
+        if independent_mode:
+            def _add_pnl_trace(fig, dates, rets, infos, row, color_bar, name):
+                if not dates:
+                    return
+                colors = [color_bar if r > 0 else "#F44336" for r in rets]
+                texts = []
+                for td, r, info in zip(dates, rets, infos):
+                    texts.append(
+                        f"{info['reason']}({info['mode']})<br>"
                         f"入场: {info['entry_dt'].date()} @ {info['entry_px']:.4f}<br>"
                         f"离场: {td.date()} @ {info['exit_px']:.4f}<br>"
                         f"收益: {info['return_pct']:+.2f}%"
                     )
-                else:
-                    pnl_texts.append(f"收益: {trade_returns_pct[len(pnl_texts)]:+.2f}%")
-            fig_ov.add_trace(go.Bar(
-                x=trade_dates, y=trade_returns_pct, marker_color=colors,
-                name="Trade PnL %", text=pnl_texts, hoverinfo="text",
-            ), row=4, col=1)
+                fig.add_trace(go.Bar(
+                    x=dates, y=rets, marker_color=colors,
+                    name=name, text=texts, hoverinfo="text",
+                ), row=row, col=1)
 
+            _add_pnl_trace(fig_ov, grid_trade_dates, grid_trade_returns,
+                           grid_trade_infos, 5, "#1a5276", "Grid PnL")
+            _add_pnl_trace(fig_ov, sw_trade_dates, sw_trade_returns,
+                           sw_trade_infos, 6, "#c0392b", "Switch PnL")
+        else:
+            if trade_returns_pct:
+                colors = ["#4CAF50" if r > 0 else "#F44336" for r in trade_returns_pct]
+                pnl_texts = []
+                for td in trade_dates:
+                    info = exit_info_map.get(td)
+                    if info is not None:
+                        md_label = "Switch" if info["mode"] == 2 else "Grid"
+                        pnl_texts.append(
+                            f"{info['reason']}({md_label})<br>"
+                            f"入场: {info['entry_dt'].date()} @ {info['entry_px']:.4f}<br>"
+                            f"离场: {td.date()} @ {info['exit_px']:.4f}<br>"
+                            f"收益: {info['return_pct']:+.2f}%"
+                        )
+                    else:
+                        pnl_texts.append(f"收益: {trade_returns_pct[len(pnl_texts)]:+.2f}%")
+                fig_ov.add_trace(go.Bar(
+                    x=trade_dates, y=trade_returns_pct, marker_color=colors,
+                    name="Trade PnL %", text=pnl_texts, hoverinfo="text",
+                ), row=4, col=1)
+
+        title_text = (f"{name} — Grid vs Switch 独立仓位对比" if independent_mode
+                      else f"{name} — 整合概览 (鼠标移动同步竖线)")
         fig_ov.update_layout(
-            height=1100,
+            height=1100 if not independent_mode else 1500,
             hovermode="closest",
-            legend=dict(orientation="h", y=1.15),
-            title=f"{name} — 整合概览 (鼠标移动同步竖线)",
+            legend=dict(orientation="h", y=1.08),
+            title=title_text,
         )
-        fig_ov.update_xaxes(rangeslider_visible=False, showspikes=True,
-                            spikemode="across", spikethickness=1,
-                            spikecolor="rgba(128,128,128,0.4)")
-        fig_ov.update_yaxes(title_text="价格", row=1, col=1)
-        fig_ov.update_yaxes(title_text="累积收益", tickformat=".0%", row=2, col=1)
-        fig_ov.update_yaxes(title_text="仓位", tickformat=".0%", row=3, col=1)
-        fig_ov.update_yaxes(title_text="盈亏 %", row=4, col=1)
+        if independent_mode:
+            for r in range(1, 7):
+                fig_ov.update_xaxes(rangeslider_visible=False, row=r, col=1)
+            fig_ov.update_xaxes(showspikes=True, spikemode="across",
+                                spikethickness=1,
+                                spikecolor="rgba(128,128,128,0.4)", row=1, col=1)
+            fig_ov.update_yaxes(title_text="价格", row=1, col=1)
+            fig_ov.update_yaxes(title_text="累积收益", tickformat=".0%", row=2, col=1)
+            fig_ov.update_yaxes(title_text="仓位", tickformat=".0%", row=3, col=1)
+            fig_ov.update_yaxes(title_text="仓位", tickformat=".0%", row=4, col=1)
+            fig_ov.update_yaxes(title_text="盈亏 %", row=5, col=1)
+            fig_ov.update_yaxes(title_text="盈亏 %", row=6, col=1)
+        else:
+            fig_ov.update_xaxes(rangeslider_visible=False, showspikes=True,
+                                spikemode="across", spikethickness=1,
+                                spikecolor="rgba(128,128,128,0.4)")
+            fig_ov.update_yaxes(title_text="价格", row=1, col=1)
+            fig_ov.update_yaxes(title_text="累积收益", tickformat=".0%", row=2, col=1)
+            fig_ov.update_yaxes(title_text="仓位", tickformat=".0%", row=3, col=1)
+            fig_ov.update_yaxes(title_text="盈亏 %", row=4, col=1)
 
         p = f"{out_dir}/{safe_name}_overview.html"
         fig_ov.write_html(p)
@@ -465,8 +618,13 @@ def generate_polyfit_switch_report(
         try:
             fig_cum = go.Figure()
             fig_cum.add_trace(go.Scatter(x=idx, y=bh_cum, mode="lines", name=f"BH ({bh_ret:+.1%})", line=dict(color="gray", width=1, dash="dot")))
-            fig_cum.add_trace(go.Scatter(x=eq_f.index, y=eq_f, mode="lines", name=f"Full ({full_ret:+.1%})", line=dict(color="#2196F3", width=2)))
-            fig_cum.add_trace(go.Scatter(x=eq_g.index, y=eq_g, mode="lines", name=f"Grid-only ({grid_ret:+.1%})", line=dict(color="#4CAF50", width=1.5, dash="dash")))
+            if independent_mode:
+                eq_s = pf_switch.value() / pf_switch.value().iloc[0] - 1
+                fig_cum.add_trace(go.Scatter(x=eq_g.index, y=eq_g, mode="lines", name=f"Grid ({grid_ret:+.1%})", line=dict(color="#1a5276", width=2)))
+                fig_cum.add_trace(go.Scatter(x=eq_s.index, y=eq_s, mode="lines", name=f"Switch ({switch_ret:+.1%})", line=dict(color="#c0392b", width=2)))
+            else:
+                fig_cum.add_trace(go.Scatter(x=eq_f.index, y=eq_f, mode="lines", name=f"Full ({full_ret:+.1%})", line=dict(color="#2196F3", width=2)))
+                fig_cum.add_trace(go.Scatter(x=eq_g.index, y=eq_g, mode="lines", name=f"Grid-only ({grid_ret:+.1%})", line=dict(color="#4CAF50", width=1.5, dash="dash")))
             fig_cum.update_layout(title=f"{name} - 累积收益", height=400, hovermode="x unified", yaxis_tickformat=".0%")
             p = f"{out_dir}/{safe_name}_cum_returns.html"
             fig_cum.write_html(p)

@@ -135,27 +135,28 @@ _grid_kernel = None
 
 _GRID_KERNEL_CODE = r"""
 extern "C" __global__ void grid_signals_kernel(
-    const double* close,
-    const double* dev_pct,
-    const double* dev_trend_all,
-    const double* vol_pct_all,
-    const int* indicator_idx,
-    const double* poly_base,
-    const double* base_grid_pct,
-    const double* volatility_scale,
-    const double* trend_sensitivity,
-    const double* take_profit_grid,
-    const double* stop_loss_grid,
-    const int* max_grid_levels,
-    const int* cooldown_days,
-    const double* min_signal_strength,
-    const double* position_size,
-    const double* position_sizing_coef,
-    bool* entries,
-    bool* exits,
-    double* sizes,
+    const double* __restrict__ close,
+    const double* __restrict__ dev_pct,
+    const double* __restrict__ dev_trend_all,
+    const double* __restrict__ vol_pct_all,
+    const int* __restrict__ indicator_idx,
+    const double* __restrict__ poly_base,
+    const double* __restrict__ base_grid_pct,
+    const double* __restrict__ volatility_scale,
+    const double* __restrict__ trend_sensitivity,
+    const double* __restrict__ take_profit_grid,
+    const double* __restrict__ stop_loss_grid,
+    const int* __restrict__ max_grid_levels,
+    const int* __restrict__ cooldown_days,
+    const double* __restrict__ min_signal_strength,
+    const double* __restrict__ position_size,
+    const double* __restrict__ position_sizing_coef,
+    bool* __restrict__ entries,
+    bool* __restrict__ exits,
+    double* __restrict__ sizes,
     int n_bars,
     int n_combos,
+    int n_padded,
     int max_holding_days
 ) {
     int combo_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -190,9 +191,6 @@ extern "C" __global__ void grid_signals_kernel(
 
         if (isnan(cl) || isnan(dp) || isnan(dt) || isnan(vp)
             || isnan(pb) || pb <= 0.0 || cl <= 0.0) {
-            entries[combo_idx * n_bars + i] = false;
-            exits[combo_idx * n_bars + i] = false;
-            sizes[combo_idx * n_bars + i] = 0.0;
             continue;
         }
 
@@ -207,10 +205,6 @@ extern "C" __global__ void grid_signals_kernel(
         double dgs = bgp * (1.0 + ts * fabs(dt)) * vol_mult;
         dgs = fmax(dgs, bgp * 0.3);
 
-        entries[combo_idx * n_bars + i] = false;
-        exits[combo_idx * n_bars + i] = false;
-        sizes[combo_idx * n_bars + i] = 0.0;
-
         if (!in_position) {
             if (cooldown > 0) continue;
             double sig = fabs(dp) / fmax(dgs, 1e-9);
@@ -221,8 +215,8 @@ extern "C" __global__ void grid_signals_kernel(
                 double sz = fabs(dp) * (1.0 + fmax(vp, 0.0)) * psc;
                 sz = sz > ps ? ps : (sz < 0.0 ? 0.0 : sz);
                 if (sz > 0.0) {
-                    entries[combo_idx * n_bars + i] = true;
-                    sizes[combo_idx * n_bars + i] = sz;
+                    entries[i * n_padded + combo_idx] = true;
+                    sizes[i * n_padded + combo_idx] = sz;
                     in_position = true;
                     entry_bar = i;
                     entry_level = el;
@@ -239,14 +233,14 @@ extern "C" __global__ void grid_signals_kernel(
             double sl_threshold = entry_level * rs * slg;
             // TP/SL 均以基线偏离度 dp 为锚
             if (hl || dp >= tp_threshold || dp <= -sl_threshold) {
-                exits[combo_idx * n_bars + i] = true;
+                exits[i * n_padded + combo_idx] = true;
                 in_position = false;
                 cooldown = cd;
             }
         }
     }
     if (in_position) {
-        exits[combo_idx * n_bars + n_bars - 1] = true;
+        exits[(n_bars - 1) * n_padded + combo_idx] = true;
     }
 }
 """
@@ -338,13 +332,13 @@ def generate_grid_signals_batch(
             _pad_f64(stop_loss_grids), _pad_i32(_mgl), _pad_i32(_cd),
             _pad_f64(_mss), _pad_f64(_ps), _pad_f64(_psc),
             entries_d, exits_d, sizes_d,
-            n_bars, n_combos, max_holding_days,
+            n_bars, n_combos, padded, max_holding_days,
         ),
     )
 
-    entries = cp.asnumpy(entries_d).reshape(padded, n_bars)[:n_combos]
-    exits = cp.asnumpy(exits_d).reshape(padded, n_bars)[:n_combos]
-    sizes = cp.asnumpy(sizes_d).reshape(padded, n_bars)[:n_combos]
+    entries = cp.asnumpy(entries_d).reshape(n_bars, padded)[:, :n_combos].copy()
+    exits = cp.asnumpy(exits_d).reshape(n_bars, padded)[:, :n_combos].copy()
+    sizes = cp.asnumpy(sizes_d).reshape(n_bars, padded)[:, :n_combos].copy()
     return entries, exits, sizes
 
 
@@ -474,7 +468,7 @@ def scan_polyfit_grid(
             position_sizing_coef_arr=_tile(s1_psc),
         )
         bt = run_backtest_batch(cl_arr, entries_b, exits_b, sizes_b,
-                                n_combos=n_total, open_=op_aligned)
+                                n_combos=n_total, open_=op_aligned, transposed=True)
         for ii, (tw, vw) in enumerate(ind_keys):
             for gi, (bgp, vs, ts, max_gl, tpg, slg, pos_sz, pos_coef, min_ss) in enumerate(grid_combos):
                 idx = ii * n_grid + gi
