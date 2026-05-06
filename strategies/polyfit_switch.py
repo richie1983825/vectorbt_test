@@ -958,6 +958,274 @@ def generate_grid_priority_switch_signals_v7(
 
 
 # ══════════════════════════════════════════════════════════════════
+# v8 — v7 + 恐慌低吸模块
+#
+# 恐慌低吸 vs 顶部规避的区别：
+#   顶部反转：前期急涨>5% + 高位 + 阴线 + 大振幅 → BLOCK（V7 逻辑）
+#   恐慌低吸：前期温和(<5%) + 大阴线 + 高量 + 大振幅 → BUY（V8 新增）
+#
+# 基于 2025-04-07 和 2026-03-23 等恐慌日的分析：
+#   - 恐慌日前期涨幅温和（<5%），非顶部反转
+#   - 大振幅阴线 + 放量（>1.5x 均量）
+#   - 后续 1-3 天 V 型反弹概率高（12 个历史案例中 67% 正收益）
+#
+# 入场逻辑：
+#   1. 检测到恐慌低吸 → Grid/Switch 均空闲时直接 Switch 入场
+#   2. 跳过 OHLCV 入场过滤（恐慌模式与正常入场条件相反）
+#   3. 顶部规避期间不发生恐慌低吸（顶部后禁止入场覆盖恐慌）
+# ══════════════════════════════════════════════════════════════════
+
+def generate_grid_priority_switch_signals_v8(
+    close: np.ndarray,
+    dev_pct: np.ndarray,
+    dev_trend: np.ndarray,
+    rolling_vol_pct: np.ndarray,
+    poly_base: np.ndarray,
+    grid_entries: np.ndarray,
+    grid_exits: np.ndarray,
+    ma20: np.ndarray | None = None,
+    ma60: np.ndarray | None = None,
+    # ── Switch 入场 ──
+    trend_entry_dp: float = 0.01,
+    trend_confirm_dp_slope: float = 0.0003,
+    # ── Switch 离场（v6 优化默认值）──
+    trend_atr_mult: float = 2.0,
+    trend_atr_window: int = 14,
+    trend_vol_climax: float = 3.0,
+    trend_decline_days: int = 2,
+    # ── OHLCV ──
+    high: np.ndarray | None = None,
+    low: np.ndarray | None = None,
+    open_: np.ndarray | None = None,
+    volume: np.ndarray | None = None,
+    # ── v6 增强开关 ──
+    enable_ohlcv_filter: bool = True,
+    enable_early_exit: bool = True,
+    # ── v7 顶部规避 ──
+    enable_top_avoidance: bool = True,
+    top_ret_5d: float = 0.05,
+    top_price_pos: float = 0.80,
+    top_amplitude: float = 0.025,
+    top_block_days: int = 3,
+    # ── v8 恐慌低吸 ──
+    enable_panic_dip_buy: bool = True,
+    panic_ret_5d_max: float = 0.05,        # 5日涨幅上限（低于此值=恐慌，高于=顶部）
+    panic_amplitude: float = 0.03,          # 最小振幅
+    panic_vol_ratio: float = 1.5,           # 最小量比
+    # ── 调试 ──
+    return_filter_stats: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray] | dict:
+    """v8: v7顶部规避 + 恐慌低吸 Grid-priority Switch 策略。
+
+    在 v7 基础上增加恐慌低吸检测：
+      条件：收阴 AND 振幅>panic_amplitude AND 量比>panic_vol_ratio
+            AND 5日涨幅<panic_ret_5d_max（区别于顶部反转）
+      动作：Grid/Switch均空闲时直接Switch入场（跳过OHLCV过滤）
+    """
+    n = len(close)
+    sw_entries = np.zeros(n, dtype=bool)
+    sw_exits = np.zeros(n, dtype=bool)
+    sw_sizes = np.ones(n) * 0.99
+
+    filter_stats = {"micro_up": 0, "long_upper_wick": 0, "normal_volume": 0,
+                    "green_without_momentum": 0, "high_position": 0, "passed": 0,
+                    "top_avoided": 0, "panic_dip_buy": 0}
+
+    # Pre-compute ATR
+    _use_atr = high is not None and low is not None
+    atr_arr = np.zeros(n, dtype=np.float64)
+    if _use_atr:
+        alpha_a = 2.0 / (trend_atr_window + 1)
+        atr_ema = 0.0
+        for i in range(1, n):
+            if (np.isnan(high[i]) or np.isnan(low[i]) or np.isnan(close[i])
+                or np.isnan(close[i-1])):
+                continue
+            tr = max(high[i] - low[i], abs(high[i] - close[i-1]),
+                     abs(low[i] - close[i-1]))
+            atr_ema = tr if i == 1 else alpha_a * tr + (1.0 - alpha_a) * atr_ema
+            atr_arr[i] = atr_ema
+
+    # Pre-compute vol EMA
+    _use_vol = volume is not None
+    vol_ema_arr = np.zeros(n, dtype=np.float64)
+    if _use_vol:
+        alpha_v = 2.0 / 21.0
+        v_ema = float(volume[0]) if not np.isnan(volume[0]) else 0.0
+        vol_ema_arr[0] = v_ema
+        for i in range(1, n):
+            if not np.isnan(volume[i]):
+                v_ema = alpha_v * float(volume[i]) + (1.0 - alpha_v) * v_ema
+            vol_ema_arr[i] = v_ema
+
+    grid_in = False
+    sw_in = False
+    sw_peak = 0.0
+    sw_entry_bar = -1
+    prev_dp = np.nan
+    decline_count = 0
+    prev_ma20 = 0.0; prev_ma60 = 0.0
+
+    # 顶部规避状态
+    top_block_until = -1
+    top_signal_today = False
+
+    # 预计算20日高低
+    h20_arr = np.zeros(n, dtype=np.float64)
+    l20_arr = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        if i >= 19:
+            h20_arr[i] = np.max(high[max(0,i-19):i+1]) if high is not None else close[i]
+            l20_arr[i] = np.min(low[max(0,i-19):i+1]) if low is not None else close[i]
+
+    for i in range(n):
+        dp = dev_pct[i]; dt = dev_trend[i]; cl = close[i]
+        m20 = ma20[i] if ma20 is not None else 0.0
+        m60 = ma60[i] if ma60 is not None else 0.0
+        if np.isnan(dp) or np.isnan(dt) or np.isnan(cl) or cl <= 0:
+            prev_ma20 = m20; prev_ma60 = m60; continue
+
+        # ── v7 顶部检测 ──
+        top_signal_today = False
+        if enable_top_avoidance and i >= 20 and high is not None and low is not None:
+            ret_5d = close[i] / close[max(0, i-5)] - 1.0 if i >= 5 else 0.0
+            price_pos = (close[i] - l20_arr[i]) / (h20_arr[i] - l20_arr[i]) if h20_arr[i] > l20_arr[i] else 0.5
+            is_bearish = close[i] < open_[i] if open_ is not None else close[i] < close[i-1]
+            amplitude = (high[i] - low[i]) / close[i]
+            vol_ratio = volume[i] / vol_ema_arr[i] if _use_vol and vol_ema_arr[i] > 0 else 1.0
+
+            if (ret_5d > top_ret_5d and price_pos > top_price_pos and is_bearish
+                and amplitude > top_amplitude):
+                top_signal_today = True
+                top_block_until = i + top_block_days
+                if sw_in:
+                    sw_exits[i] = True
+                    sw_in = False
+                    sw_peak = 0.0
+                filter_stats["top_avoided"] += 1
+
+        # ── v8 恐慌低吸检测（顶部规避之后、Grid处理之前）──
+        panic_signal_today = False
+        if (enable_panic_dip_buy and i >= 20 and not top_signal_today
+            and i > top_block_until
+            and high is not None and low is not None and open_ is not None):
+            ret_5d_p = close[i] / close[max(0, i-5)] - 1.0 if i >= 5 else 0.0
+            is_bearish_p = close[i] < open_[i]
+            amplitude_p = (high[i] - low[i]) / close[i]
+            vol_ratio_p = volume[i] / vol_ema_arr[i] if _use_vol and vol_ema_arr[i] > 0 else 1.0
+
+            # 恐慌条件：大阴线 + 高量 + 大振幅 + 前期涨幅温和（非顶部）
+            if (is_bearish_p and amplitude_p > panic_amplitude
+                and vol_ratio_p > panic_vol_ratio
+                and ret_5d_p < panic_ret_5d_max):
+                panic_signal_today = True
+                filter_stats["panic_dip_buy"] += 1
+                # 空闲时直接入场（跳过OHLCV过滤）
+                if not grid_in and not sw_in:
+                    sw_entries[i] = True
+                    sw_in = True
+                    sw_peak = cl
+                    sw_entry_bar = i
+                    decline_count = 0
+
+        # ── 1. Grid exits first ──
+        grid_just_exited = False
+        if grid_in and grid_exits[i]:
+            grid_in = False
+            grid_just_exited = True
+
+        # ── 2. Grid entry = force Switch exit + Grid enters ──
+        #     但顶部规避期间禁止 Grid 入场
+        if grid_entries[i] and i > top_block_until:
+            if sw_in:
+                sw_exits[i] = True
+                sw_in = False
+                sw_peak = 0.0
+            grid_in = True
+            prev_ma20 = m20; prev_ma60 = m60
+            continue
+
+        # ── 3. Only if Grid is idle ──
+        if not grid_in and not grid_just_exited:
+            if not sw_in:
+                # 顶部规避期间禁止 Switch 入场（恐慌入场已在上面处理）
+                if i <= top_block_until:
+                    prev_ma20 = m20; prev_ma60 = m60
+                    continue
+
+                # 恐慌日已入场则跳过正常入场逻辑
+                if panic_signal_today and sw_in:
+                    prev_ma20 = m20; prev_ma60 = m60
+                    continue
+
+                if dp >= trend_entry_dp:
+                    cond_s = dt > trend_confirm_dp_slope
+                    cond_m = (not np.isnan(m20) and not np.isnan(m60) and m20 > m60)
+                    if cond_s or cond_m:
+                        if enable_ohlcv_filter and i >= 10:
+                            feat = _compute_entry_ohlcv_features(
+                                close, open_, high, low, volume, vol_ema_arr, i)
+                            passed, reason = _check_entry_filters(
+                                feat, trend_entry_dp, trend_confirm_dp_slope)
+                            if not passed:
+                                filter_stats[reason] += 1
+                                prev_ma20 = m20; prev_ma60 = m60
+                                continue
+                            filter_stats["passed"] += 1
+
+                        sw_entries[i] = True
+                        sw_in = True
+                        sw_peak = cl
+                        sw_entry_bar = i
+                        decline_count = 0
+            else:
+                exit_now = False
+
+                if enable_early_exit and dp < -0.005 and decline_count >= 1:
+                    exit_now = True
+                elif trend_decline_days > 0 and decline_count >= trend_decline_days:
+                    exit_now = True
+                elif _use_atr and atr_arr[i] > 0:
+                    if cl <= sw_peak - trend_atr_mult * atr_arr[i]:
+                        exit_now = True
+                elif _use_vol:
+                    rv = volume[i] / max(vol_ema_arr[i], 1e-9)
+                    if rv > trend_vol_climax and i > 0 and cl > close[i-1]:
+                        exit_now = True
+                elif ma20 is not None and ma60 is not None:
+                    if (not np.isnan(m20) and not np.isnan(m60)
+                        and not np.isnan(prev_ma20) and not np.isnan(prev_ma60)
+                        and m20 < m60 and prev_ma20 >= prev_ma60):
+                        exit_now = True
+
+                if exit_now:
+                    sw_exits[i] = True
+                    sw_in = False
+                    sw_peak = 0.0
+                else:
+                    sw_peak = max(sw_peak, cl)
+
+        # dp decline tracking
+        if not np.isnan(prev_dp) and not np.isnan(dp):
+            if dp < prev_dp: decline_count += 1
+            else: decline_count = 0
+        prev_dp = dp
+        prev_ma20 = m20; prev_ma60 = m60
+
+    if sw_in:
+        sw_exits[-1] = True
+
+    if return_filter_stats:
+        return {
+            "sw_entries": sw_entries,
+            "sw_exits": sw_exits,
+            "sw_sizes": sw_sizes,
+            "filter_stats": filter_stats,
+        }
+    return sw_entries, sw_exits, sw_sizes
+
+
+# ══════════════════════════════════════════════════════════════════
 # GPU 批量信号生成 — CuPy RawKernel (v4)
 #
 # v4 改动：

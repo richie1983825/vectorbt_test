@@ -1,11 +1,11 @@
 """
-VectorBT Walk-Forward — Polyfit-Grid vs Polyfit-Switch-v6 vs Polyfit-Switch-v7 对比。
+VectorBT Walk-Forward — Grid vs Switch-v6 vs Switch-v7 对比。
 
 Stage 1: Grid WF (GPU, 缓存)
-Stage 2: Switch-v7 WF (CPU 扫描, 含顶部规避参数)
+Stage 2: Switch-v7 WF (CPU, V6固定base + 扫描顶部规避)
 V6 使用历史最优固定参数，不参与 WF 扫描。
 
-输出 Grid/Switch-v6/Switch-v7 的 return/balanced OOS 对比 + HTML 报告。
+输出 Grid/Switch-v6/Switch-v7 的 return/balanced OOS 对比 + HTML 报告(V7策略)。
 """
 
 import os, time, warnings
@@ -32,6 +32,11 @@ V6_BEST_GRID = dict(trend_window_days=10, vol_window_days=10, base_grid_pct=0.01
     stop_loss_grid=1.6, max_holding_days=45, cooldown_days=1, min_signal_strength=0.3,
     position_size=0.99, position_sizing_coef=60)
 V6_BEST_SWITCH = dict(trend_entry_dp=0.0, trend_confirm_dp_slope=0.0,
+    trend_atr_mult=1.5, trend_atr_window=14, trend_vol_climax=2.5, trend_decline_days=1,
+    enable_ohlcv_filter=True, enable_early_exit=True)
+
+# V7 base 参数（V6固定最优）
+V7_BASE_SWITCH = dict(trend_entry_dp=0.0, trend_confirm_dp_slope=0.0,
     trend_atr_mult=1.5, trend_atr_window=14, trend_vol_climax=2.5, trend_decline_days=1,
     enable_ohlcv_filter=True, enable_early_exit=True)
 
@@ -110,6 +115,79 @@ def _eval_v6_oos(close_warmup_all, open_, high, low, volume, test_offset):
             "test_max_dd": m["max_drawdown"], "num_trades": m["num_trades"], "win_rate": m["win_rate"]}
 
 
+def _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, switch_df, df_report, REPORTS_DIR):
+    """使用 V7 WF 最优参数生成全量回测报告。"""
+    from utils.backtest import run_backtest as _bt
+    from utils.reports import generate_polyfit_switch_report
+
+    v7_return = switch_df[(switch_df["selector"] == "return")]
+    if v7_return.empty:
+        return None
+    br = v7_return.nlargest(1, "test_return").iloc[0]
+
+    tw = int(br["trend_window_days"]); vw = int(br["vol_window_days"])
+    sw_ind = compute_polyfit_switch_indicators(close_hfq, fit_window_days=252, ma_windows=[20, 60],
+                                                trend_window_days=tw, vol_window_days=vw)
+    idx_s = sw_ind.index; cl_s = close_hfq.loc[idx_s]; op_s = open_raw.reindex(idx_s)
+    hi_s = high_raw.reindex(idx_s); lo_s = low_raw.reindex(idx_s); vol_s = volume_raw.reindex(idx_s)
+
+    # Grid 信号（使用 V7 窗口的 Grid 参数）
+    e_grid_s, x_grid_s, s_grid_s = generate_grid_signals(
+        cl_s.values, sw_ind["PolyDevPct"].values, sw_ind["PolyDevTrend"].values,
+        sw_ind["RollingVolPct"].values, sw_ind["PolyBasePred"].values,
+        base_grid_pct=br.get("base_grid_pct", 0.01),
+        volatility_scale=br.get("volatility_scale", 0),
+        trend_sensitivity=br.get("trend_sensitivity", 4),
+        max_grid_levels=int(br.get("max_grid_levels", 3)),
+        take_profit_grid=br.get("take_profit_grid", 0.8),
+        stop_loss_grid=br.get("stop_loss_grid", 1.6),
+        max_holding_days=int(br.get("max_holding_days", 45)),
+        cooldown_days=int(br.get("cooldown_days", 1)),
+        min_signal_strength=br.get("min_signal_strength", 0.3),
+        position_size=br.get("position_size", 0.99),
+        position_sizing_coef=br.get("position_sizing_coef", 60),
+    )
+
+    # V7 Switch 信号（含顶部规避）
+    v7_top_params = {}
+    for k in ["enable_top_avoidance", "top_ret_5d", "top_price_pos", "top_amplitude", "top_block_days"]:
+        if k in br.index:
+            v7_top_params[k] = br[k]
+
+    sw_e, sw_x, sw_sz = generate_grid_priority_switch_signals_v7(
+        cl_s.values, sw_ind["PolyDevPct"].values, sw_ind["PolyDevTrend"].values,
+        sw_ind["RollingVolPct"].values, sw_ind["PolyBasePred"].values,
+        e_grid_s, x_grid_s, sw_ind["MA20"].values, sw_ind["MA60"].values,
+        trend_entry_dp=V7_BASE_SWITCH["trend_entry_dp"],
+        trend_confirm_dp_slope=V7_BASE_SWITCH["trend_confirm_dp_slope"],
+        trend_atr_mult=V7_BASE_SWITCH["trend_atr_mult"],
+        trend_atr_window=V7_BASE_SWITCH["trend_atr_window"],
+        trend_vol_climax=V7_BASE_SWITCH["trend_vol_climax"],
+        trend_decline_days=V7_BASE_SWITCH["trend_decline_days"],
+        enable_ohlcv_filter=V7_BASE_SWITCH["enable_ohlcv_filter"],
+        enable_early_exit=V7_BASE_SWITCH["enable_early_exit"],
+        high=hi_s.values, low=lo_s.values, open_=op_s.values, volume=vol_s.values,
+        **v7_top_params,
+    )
+
+    fill_price_s = op_s.shift(-1).reindex(idx_s)
+    pf_grid = vbt.Portfolio.from_signals(fill_price_s, entries=pd.Series(e_grid_s, index=idx_s),
+        exits=pd.Series(x_grid_s, index=idx_s), size=pd.Series(s_grid_s, index=idx_s),
+        size_type="percent", init_cash=1.0, freq="D")
+    pf_sw = vbt.Portfolio.from_signals(fill_price_s, entries=pd.Series(sw_e, index=idx_s),
+        exits=pd.Series(sw_x, index=idx_s), size=pd.Series(sw_sz, index=idx_s),
+        size_type="percent", init_cash=1.0, freq="D")
+    e_merged = e_grid_s | sw_e; x_merged = x_grid_s | sw_x
+    s_merged = np.where(e_grid_s, s_grid_s, sw_sz)
+    modes_merged = np.zeros(len(e_merged), dtype=int); modes_merged[e_grid_s]=1; modes_merged[sw_e]=2
+
+    all_params = {**{k: br[k] for k in GRID_PARAMS_KEYS if k in br.index},
+                  **V7_BASE_SWITCH, **v7_top_params}
+    return generate_polyfit_switch_report(df_report, cl_s, e_merged, x_merged, s_merged, modes_merged,
+        params=all_params, name="Polyfit-Switch-v7",
+        reports_dir=REPORTS_DIR, open_=op_s, pf_grid=pf_grid, pf_switch=pf_sw)
+
+
 if __name__ == "__main__":
     os.makedirs(REPORTS_DIR, exist_ok=True)
     gpu_info = detect_gpu(); print_gpu_info(gpu_info)
@@ -167,8 +245,8 @@ if __name__ == "__main__":
 
     best_name = _print_combo_table(all_wf)
 
-    # ── HTML 报告（最优组合）──
-    print(f"\n{'═' * 70}\n  Generating HTML Reports — 最优: {best_name}\n{'═' * 70}")
+    # ── HTML 报告（V7 策略）──
+    print(f"\n{'═' * 70}\n  Generating HTML Reports — V7 策略\n{'═' * 70}")
     from utils.reports import generate_polyfit_grid_report, generate_polyfit_switch_report, build_index_html
 
     base_ind_full = compute_polyfit_base_only(close_hfq, fit_window_days=252, ma_windows=[])
@@ -198,7 +276,7 @@ if __name__ == "__main__":
             params={k:br[k] for k in GRID_PARAMS_KEYS if k in br.index}, name="Polyfit-Grid",
             reports_dir=REPORTS_DIR, open_=op_g))
 
-    # Switch 报告 (V6 固定最优参数)
+    # Switch-v6 报告 (V6 固定最优参数)
     sw_ind = compute_polyfit_switch_indicators(close_hfq, fit_window_days=252, ma_windows=[20,60],
                                                 trend_window_days=10, vol_window_days=10)
     idx_s = sw_ind.index; cl_s = close_hfq.loc[idx_s]; op_s = open_raw.reindex(idx_s)
@@ -232,6 +310,11 @@ if __name__ == "__main__":
     reports_meta.append(generate_polyfit_switch_report(df_report, cl_s, e_merged, x_merged, s_merged, modes_merged,
         params={**V6_BEST_GRID, **V6_BEST_SWITCH}, name="Polyfit-Switch-v6",
         reports_dir=REPORTS_DIR, open_=op_s, pf_grid=pf_grid, pf_switch=pf_sw))
+
+    # Switch-v7 报告 (WF 最优参数)
+    v7_report = _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, switch_df, df_report, REPORTS_DIR)
+    if v7_report:
+        reports_meta.append(v7_report)
 
     if reports_meta:
         with open(f"{REPORTS_DIR}/index.html", "w") as f:
