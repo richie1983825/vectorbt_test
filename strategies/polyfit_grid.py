@@ -9,7 +9,7 @@
   - 离场：止盈 / 止损 / 最大持仓天数
   - 执行：次日开盘价成交
 
-GPU 加速：CuPy RawKernel 批量信号生成 + 批量回测。
+GPU 加速：MLX（Apple Silicon）向量化批量信号生成 + 批量回测。
 """
 
 from itertools import product
@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from utils.backtest import run_backtest, run_backtest_batch
-from utils.gpu import xp, gpu
+from utils.gpu import gpu, get_mlx
 from utils.indicators import compute_polyfit_switch_indicators
 
 
@@ -115,7 +115,6 @@ def generate_grid_signals(
                         if not np.isnan(entry_grid_step) else dynamic_grid_step)
             tp_threshold = entry_level * ref_step * take_profit_grid
             sl_threshold = entry_level * ref_step * stop_loss_grid
-            # TP/SL 均以基线偏离度 dp 为锚
             if hold_limit or dev_pct[i] >= tp_threshold or dev_pct[i] <= -sl_threshold:
                 exits[i] = True
                 in_position = False
@@ -128,218 +127,226 @@ def generate_grid_signals(
 
 
 # ══════════════════════════════════════════════════════════════════
-# GPU 批量信号生成 — CuPy RawKernel（纯 Grid）
+# MLX 批量信号生成 + 回测（合并，单次 bar loop）
+#
+# 将信号生成和回测合并到一个 bar-by-bar 循环中，
+# 避免存储巨大的信号数组 [n_combos, n_bars]。
+# 每 bar 内所有 combo 在 MLX GPU 上并行处理。
 # ══════════════════════════════════════════════════════════════════
 
-_grid_kernel = None
+def _grid_scan_mlx(
+    close_arr: np.ndarray,
+    dev_pct_arr: np.ndarray,
+    dev_trend_arr: np.ndarray,
+    vol_arr: np.ndarray,
+    poly_base_arr: np.ndarray,
+    bgp_arr: np.ndarray,
+    vs_arr: np.ndarray,
+    ts_arr: np.ndarray,
+    mgl_arr: np.ndarray,
+    tpg_arr: np.ndarray,
+    slg_arr: np.ndarray,
+    psz_arr: np.ndarray,
+    psc_arr: np.ndarray,
+    mss_arr: np.ndarray,
+    cd_arr: np.ndarray,
+    max_holding_days: int,
+    open_arr: np.ndarray | None,
+    init_cash: float = 100_000.0,
+) -> np.ndarray:
+    """MLX 合并信号生成 + 回测：单次 bar loop 处理所有 combo。
 
-_GRID_KERNEL_CODE = r"""
-extern "C" __global__ void grid_signals_kernel(
-    const double* __restrict__ close,
-    const double* __restrict__ dev_pct,
-    const double* __restrict__ dev_trend_all,
-    const double* __restrict__ vol_pct_all,
-    const int* __restrict__ indicator_idx,
-    const double* __restrict__ poly_base,
-    const double* __restrict__ base_grid_pct,
-    const double* __restrict__ volatility_scale,
-    const double* __restrict__ trend_sensitivity,
-    const double* __restrict__ take_profit_grid,
-    const double* __restrict__ stop_loss_grid,
-    const int* __restrict__ max_grid_levels,
-    const int* __restrict__ cooldown_days,
-    const double* __restrict__ min_signal_strength,
-    const double* __restrict__ position_size,
-    const double* __restrict__ position_sizing_coef,
-    bool* __restrict__ entries,
-    bool* __restrict__ exits,
-    double* __restrict__ sizes,
-    int n_bars,
-    int n_combos,
-    int n_padded,
-    int max_holding_days
-) {
-    int combo_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (combo_idx >= n_combos) return;
-
-    int iset = indicator_idx[combo_idx];
-
-    double bgp = base_grid_pct[combo_idx];
-    double vs = volatility_scale[combo_idx];
-    double ts = trend_sensitivity[combo_idx];
-    double tpg = take_profit_grid[combo_idx];
-    double slg = stop_loss_grid[combo_idx];
-    int mgl = max_grid_levels[combo_idx];
-    int cd = cooldown_days[combo_idx];
-    double mss = min_signal_strength[combo_idx];
-    double ps = position_size[combo_idx];
-    double psc = position_sizing_coef[combo_idx];
-
-    bool in_position = false;
-    int entry_bar = -1;
-    int entry_level = 1;
-    double entry_grid_step = -1.0;
-    double entry_close_price = 0.0 / 0.0;  // NaN
-    int cooldown = 0;
-
-    for (int i = 0; i < n_bars; i++) {
-        double cl = close[i];
-        double dp = dev_pct[i];
-        double dt = dev_trend_all[iset * n_bars + i];
-        double vp = vol_pct_all[iset * n_bars + i];
-        double pb = poly_base[i];
-
-        if (isnan(cl) || isnan(dp) || isnan(dt) || isnan(vp)
-            || isnan(pb) || pb <= 0.0 || cl <= 0.0) {
-            continue;
-        }
-
-        if (!in_position) {
-            entry_bar = -1;
-            entry_level = 1;
-            entry_grid_step = -1.0;
-        }
-        if (cooldown > 0) cooldown--;
-
-        double vol_mult = 1.0 + vs * fmax(vp, 0.0);
-        double dgs = bgp * (1.0 + ts * fabs(dt)) * vol_mult;
-        dgs = fmax(dgs, bgp * 0.3);
-
-        if (!in_position) {
-            if (cooldown > 0) continue;
-            double sig = fabs(dp) / fmax(dgs, 1e-9);
-            int el = (int)floor(sig);
-            el = el < 1 ? 1 : (el > mgl ? mgl : el);
-            double eth = -(double)el * dgs;
-            if (dp <= eth && sig >= mss) {
-                double sz = fabs(dp) * (1.0 + fmax(vp, 0.0)) * psc;
-                sz = sz > ps ? ps : (sz < 0.0 ? 0.0 : sz);
-                if (sz > 0.0) {
-                    entries[i * n_padded + combo_idx] = true;
-                    sizes[i * n_padded + combo_idx] = sz;
-                    in_position = true;
-                    entry_bar = i;
-                    entry_level = el;
-                    entry_grid_step = dgs;
-                    entry_close_price = cl;
-                }
-            }
-        } else {
-            int hd = i - entry_bar;
-            bool hl = hd >= max_holding_days;
-            double rs = fmax(dgs, entry_grid_step);
-            if (entry_grid_step < 0.0) rs = dgs;
-            double tp_threshold = entry_level * rs * tpg;
-            double sl_threshold = entry_level * rs * slg;
-            // TP/SL 均以基线偏离度 dp 为锚
-            if (hl || dp >= tp_threshold || dp <= -sl_threshold) {
-                exits[i * n_padded + combo_idx] = true;
-                in_position = false;
-                cooldown = cd;
-            }
-        }
-    }
-    if (in_position) {
-        exits[(n_bars - 1) * n_padded + combo_idx] = true;
-    }
-}
-"""
-
-
-def _get_grid_kernel():
-    global _grid_kernel
-    if _grid_kernel is None:
-        cp = xp()
-        _grid_kernel = cp.RawKernel(_GRID_KERNEL_CODE, "grid_signals_kernel")
-    return _grid_kernel
-
-
-def generate_grid_signals_batch(
-    close: np.ndarray,
-    dev_pct: np.ndarray,
-    dev_trend_all: np.ndarray,       # [n_indicator_sets, n_bars]
-    rolling_vol_pct_all: np.ndarray, # [n_indicator_sets, n_bars]
-    poly_base: np.ndarray,
-    base_grid_pcts: np.ndarray,
-    volatility_scales: np.ndarray,
-    trend_sensitivities: np.ndarray,
-    take_profit_grids: np.ndarray,
-    stop_loss_grids: np.ndarray,
-    indicator_idx: np.ndarray | None = None,
-    max_grid_levels_arr: np.ndarray | None = None,
-    max_holding_days: int = 45,
-    cooldown_days_arr: np.ndarray | None = None,
-    min_signal_strength_arr: np.ndarray | None = None,
-    position_size_arr: np.ndarray | None = None,
-    position_sizing_coef_arr: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """GPU 批量生成纯 Grid 策略信号。
-
-    支持多 indicator set 批量处理，通过 indicator_idx 指定组合归属。
+    Returns:
+        numpy [n_combos, 6]: total_return, sharpe, max_dd, calmar, num_trades, win_rate
     """
-    cp = xp()
-    n_bars = len(close)
-    n_combos = len(base_grid_pcts)
+    import mlx.core as mx
 
-    if dev_trend_all.ndim == 1:
-        dev_trend_all = dev_trend_all.reshape(1, -1)
-    if rolling_vol_pct_all.ndim == 1:
-        rolling_vol_pct_all = rolling_vol_pct_all.reshape(1, -1)
+    n_bars = len(close_arr)
+    n_combos = len(bgp_arr)
+    if n_bars == 0 or n_combos == 0:
+        return np.zeros((n_combos, 6), dtype=np.float64)
 
-    if indicator_idx is None:
-        indicator_idx = np.zeros(n_combos, dtype=np.int32)
+    # 成交价
+    if open_arr is not None:
+        fill_price = np.roll(open_arr, -1).astype(np.float32)
+        fill_price[-1] = float(close_arr[-1])
+    else:
+        fill_price = close_arr.astype(np.float32)
 
-    block_size = 256
-    grid_size = (n_combos + block_size - 1) // block_size
-    padded = grid_size * block_size
+    close_f32 = close_arr.astype(np.float32)
+    dp_f32 = dev_pct_arr.astype(np.float32)
+    dt_f32 = dev_trend_arr.astype(np.float32)
+    vol_f32 = vol_arr.astype(np.float32)
+    pb_f32 = poly_base_arr.astype(np.float32)
 
-    def _pad_f64(a):
-        result = cp.zeros(padded, dtype=cp.float64)
-        result[:n_combos] = cp.asarray(a, dtype=cp.float64)
-        if padded > n_combos:
-            result[n_combos:] = cp.nan
-        return result
+    # ── 参数数组 ──
+    bgp_mx = mx.array(bgp_arr.astype(np.float32))
+    vs_mx = mx.array(vs_arr.astype(np.float32))
+    ts_mx = mx.array(ts_arr.astype(np.float32))
+    mgl_mx = mx.array(mgl_arr.astype(np.float32))
+    tpg_mx = mx.array(tpg_arr.astype(np.float32))
+    slg_mx = mx.array(slg_arr.astype(np.float32))
+    psz_mx = mx.array(psz_arr.astype(np.float32))
+    psc_mx = mx.array(psc_arr.astype(np.float32))
+    mss_mx = mx.array(mss_arr.astype(np.float32))
+    cd_mx = mx.array(cd_arr.astype(np.float32))
+    mhd_f = mx.array(float(max_holding_days), dtype=mx.float32)
 
-    def _pad_i32(a):
-        result = cp.zeros(padded, dtype=cp.int32)
-        result[:n_combos] = cp.asarray(a, dtype=cp.int32)
-        return result
+    # ── 信号状态 ──
+    in_position = mx.zeros(n_combos, dtype=mx.float32)
+    entry_bar = mx.full(n_combos, mx.array(-1.0, dtype=mx.float32))
+    entry_level = mx.ones(n_combos, dtype=mx.float32)
+    entry_grid_step = mx.full(n_combos, mx.array(float("nan"), dtype=mx.float32))
+    cooldown = mx.zeros(n_combos, dtype=mx.float32)
 
-    _mgl = max_grid_levels_arr if max_grid_levels_arr is not None else np.full(n_combos, 3, dtype=np.int32)
-    _cd  = cooldown_days_arr if cooldown_days_arr is not None else np.full(n_combos, 1, dtype=np.int32)
-    _mss = min_signal_strength_arr if min_signal_strength_arr is not None else np.full(n_combos, 0.45, dtype=np.float64)
-    _ps  = position_size_arr if position_size_arr is not None else np.full(n_combos, 0.5, dtype=np.float64)
-    _psc = position_sizing_coef_arr if position_sizing_coef_arr is not None else np.full(n_combos, 30.0, dtype=np.float64)
+    # ── 回测状态 ──
+    cash = mx.full(n_combos, mx.array(float(init_cash), dtype=mx.float32))
+    position = mx.zeros(n_combos, dtype=mx.float32)
+    entry_cost = mx.zeros(n_combos, dtype=mx.float32)
+    peak_nav = mx.full(n_combos, mx.array(float(init_cash), dtype=mx.float32))
+    min_drawdown = mx.zeros(n_combos, dtype=mx.float32)
+    prev_nav = mx.full(n_combos, mx.array(float(init_cash), dtype=mx.float32))
+    sum_ret = mx.zeros(n_combos, dtype=mx.float32)
+    sum_ret2 = mx.zeros(n_combos, dtype=mx.float32)
+    trade_count = mx.zeros(n_combos, dtype=mx.int32)
+    win_count = mx.zeros(n_combos, dtype=mx.int32)
 
-    close_d = cp.asarray(close, dtype=cp.float64)
-    dev_d = cp.asarray(dev_pct, dtype=cp.float64)
-    trend_d = cp.asarray(dev_trend_all.ravel(), dtype=cp.float64)
-    vol_d = cp.asarray(rolling_vol_pct_all.ravel(), dtype=cp.float64)
-    iset_d = _pad_i32(indicator_idx)
-    pb_d = cp.asarray(poly_base, dtype=cp.float64)
+    zero_f = mx.array(0.0, dtype=mx.float32)
+    one_f = mx.array(1.0, dtype=mx.float32)
+    one_i = mx.array(1, dtype=mx.int32)
+    nan_f = mx.array(float("nan"), dtype=mx.float32)
 
-    entries_d = cp.zeros(padded * n_bars, dtype=cp.bool_)
-    exits_d = cp.zeros(padded * n_bars, dtype=cp.bool_)
-    sizes_d = cp.zeros(padded * n_bars, dtype=cp.float64)
+    for i in range(n_bars):
+        cl = mx.array(float(close_f32[i]), dtype=mx.float32)
+        fp = mx.array(float(fill_price[i]), dtype=mx.float32)
+        dp = mx.array(float(dp_f32[i]), dtype=mx.float32)
+        dt = mx.array(float(dt_f32[i]), dtype=mx.float32)
+        vp = mx.array(float(vol_f32[i]), dtype=mx.float32)
+        pb = mx.array(float(pb_f32[i]), dtype=mx.float32)
 
-    kernel = _get_grid_kernel()
-    kernel(
-        (grid_size,), (block_size,),
-        (
-            close_d, dev_d, trend_d, vol_d, iset_d, pb_d,
-            _pad_f64(base_grid_pcts), _pad_f64(volatility_scales),
-            _pad_f64(trend_sensitivities), _pad_f64(take_profit_grids),
-            _pad_f64(stop_loss_grids), _pad_i32(_mgl), _pad_i32(_cd),
-            _pad_f64(_mss), _pad_f64(_ps), _pad_f64(_psc),
-            entries_d, exits_d, sizes_d,
-            n_bars, n_combos, padded, max_holding_days,
-        ),
-    )
+        # 有效性
+        valid = (~mx.isnan(cl) & (cl > zero_f)
+                 & ~mx.isnan(dp) & ~mx.isnan(dt) & ~mx.isnan(vp)
+                 & ~mx.isnan(pb) & (pb > zero_f))
 
-    entries = cp.asnumpy(entries_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    exits = cp.asnumpy(exits_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    sizes = cp.asnumpy(sizes_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    return entries, exits, sizes
+        # Cooldown 递减（不在持仓中的 combo）
+        cooldown = mx.where((in_position <= zero_f) & (cooldown > zero_f) & valid,
+                            cooldown - one_f, cooldown)
+
+        # 动态网格步长
+        vol_mult = one_f + vs_mx * mx.maximum(vp, zero_f)
+        dgs = bgp_mx * (one_f + ts_mx * mx.abs(dt)) * vol_mult
+        dgs = mx.maximum(dgs, bgp_mx * mx.array(0.3, dtype=mx.float32))
+
+        # ── 入场逻辑 ──
+        sig = mx.abs(dp) / mx.maximum(dgs, mx.array(1e-9, dtype=mx.float32))
+        el = mx.floor(sig)
+        el = mx.where(el < one_f, one_f, mx.where(el > mgl_mx, mgl_mx, el))
+        eth = -el * dgs
+
+        can_enter = ((in_position <= zero_f) & (cooldown <= zero_f)
+                     & (dp <= eth) & (sig >= mss_mx) & valid)
+        sz = mx.abs(dp) * (one_f + mx.maximum(vp, zero_f)) * psc_mx
+        sz = mx.where(sz > psz_mx, psz_mx, mx.where(sz < zero_f, zero_f, sz))
+        can_enter = can_enter & (sz > zero_f)
+
+        # 执行入场（先保存入场前状态，避免同 bar 入场+离场）
+        was_in = in_position
+        buy_amount = cash * sz
+        shares = mx.where(can_enter, buy_amount / fp, zero_f)
+        cash = mx.where(can_enter, cash - shares * fp, cash)
+        position = mx.where(can_enter, shares, position)
+        entry_cost = mx.where(can_enter, shares * fp, entry_cost)
+        in_position = mx.where(can_enter, one_f, in_position)
+        entry_bar = mx.where(can_enter, mx.array(float(i), dtype=mx.float32), entry_bar)
+        entry_level = mx.where(can_enter, el, entry_level)
+        entry_grid_step = mx.where(can_enter, dgs, entry_grid_step)
+
+        # ── 离场逻辑（仅对入场前已持仓的 combo，匹配 CPU 的 if-else 语义）──
+        hd = mx.array(float(i), dtype=mx.float32) - entry_bar
+        hl = hd >= mhd_f
+        rs = mx.maximum(dgs, entry_grid_step)
+        rs = mx.where(mx.isnan(entry_grid_step), dgs, rs)
+        tp_threshold = entry_level * rs * tpg_mx
+        sl_threshold = entry_level * rs * slg_mx
+
+        can_exit = ((was_in > zero_f)
+                    & (hl | (dp >= tp_threshold) | (dp <= -sl_threshold))
+                    & valid)
+
+        # 执行离场
+        sell_amount = position * fp
+        cash = mx.where(can_exit, cash + sell_amount, cash)
+        win_trade = (sell_amount > entry_cost) & can_exit
+        win_count = mx.where(win_trade, win_count + one_i, win_count)
+        trade_count = mx.where(can_exit, trade_count + one_i, trade_count)
+        position = mx.where(can_exit, zero_f, position)
+        entry_cost = mx.where(can_exit, zero_f, entry_cost)
+        in_position = mx.where(can_exit, zero_f, in_position)
+        cooldown = mx.where(can_exit, cd_mx, cooldown)
+
+        # ── NAV 统计 ──
+        nav = cash + position * cl
+        valid_prev = prev_nav > zero_f
+        ret = mx.where(valid_prev, (nav - prev_nav) / prev_nav, zero_f)
+        sum_ret = sum_ret + ret
+        sum_ret2 = sum_ret2 + ret * ret
+        peak_nav = mx.maximum(peak_nav, nav)
+        dd = mx.where(peak_nav > zero_f, (nav - peak_nav) / peak_nav, zero_f)
+        min_drawdown = mx.minimum(min_drawdown, dd)
+        prev_nav = nav
+
+        mx.eval(cash, position, in_position, entry_cost, entry_bar,
+                entry_level, entry_grid_step, cooldown,
+                peak_nav, min_drawdown, prev_nav,
+                sum_ret, sum_ret2, trade_count, win_count)
+
+    # ── 末尾强制平仓 ──
+    final_cl = mx.array(float(close_f32[-1]), dtype=mx.float32)
+    still_in = in_position > zero_f
+    sell_amount = position * final_cl
+    cash = mx.where(still_in, cash + sell_amount, cash)
+    win_trade = sell_amount > entry_cost
+    win_count = mx.where(still_in & win_trade, win_count + one_i, win_count)
+    trade_count = mx.where(still_in, trade_count + one_i, trade_count)
+    position = mx.where(still_in, zero_f, position)
+    mx.eval(cash, position, win_count, trade_count)
+
+    # ── 计算指标 ──
+    final_nav = cash + position * final_cl
+    init_cash_f = mx.array(float(init_cash), dtype=mx.float32)
+    total_return = (final_nav - init_cash_f) / init_cash_f
+    max_dd = min_drawdown
+
+    n_bars_f = mx.array(float(n_bars), dtype=mx.float32)
+    mean_ret = sum_ret / n_bars_f
+    var = sum_ret2 / n_bars_f - mean_ret * mean_ret
+    sharpe = mx.zeros(n_combos, dtype=mx.float32)
+    valid_var = var > mx.array(1e-12, dtype=mx.float32)
+    sharpe = mx.where(valid_var,
+                      (mean_ret / mx.sqrt(var)) * mx.sqrt(mx.array(365.0, dtype=mx.float32)),
+                      zero_f)
+
+    calmar = mx.zeros(n_combos, dtype=mx.float32)
+    valid_dd = max_dd < mx.array(-1e-9, dtype=mx.float32)
+    calmar = mx.where(valid_dd, total_return / mx.abs(max_dd), zero_f)
+
+    win_rate = mx.zeros(n_combos, dtype=mx.float32)
+    has_trades = trade_count > 0
+    win_rate = mx.where(has_trades,
+                        win_count.astype(mx.float32) / trade_count.astype(mx.float32),
+                        zero_f)
+
+    mx.eval(total_return, sharpe, max_dd, calmar, trade_count, win_rate)
+
+    return np.column_stack([
+        np.array(total_return).astype(np.float64),
+        np.array(sharpe).astype(np.float64),
+        np.array(max_dd).astype(np.float64),
+        np.array(calmar).astype(np.float64),
+        np.array(trade_count).astype(np.float64),
+        np.array(win_rate).astype(np.float64),
+    ])
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -361,7 +368,7 @@ def clear_grid_cache() -> None:
 def scan_polyfit_grid(
     close: pd.Series, open_: pd.Series | None = None,
 ) -> pd.DataFrame:
-    """Polyfit-Grid 策略参数扫描（GPU 批量）。
+    """Polyfit-Grid 策略参数扫描（MLX GPU 批量）。
 
     扫描参数：
       - indicator: trend_window_days × vol_window_days
@@ -374,9 +381,8 @@ def scan_polyfit_grid(
         print("  [PolyfitGrid] Cache hit — reusing scan results")
         return _grid_scan_cache[cache_key].copy()
 
-    use_gpu = gpu()["cupy_available"]
+    use_mlx = gpu()["mlx_available"]
     open_arr = open_.values if open_ is not None else None
-    all_ma_windows: list[int] = []  # Grid-only 不需要 MA
 
     trend_windows = [10, 15, 20]
     vol_windows = [10, 20, 30]
@@ -390,7 +396,7 @@ def scan_polyfit_grid(
     position_sizing_coefs = [20.0, 30.0, 60.0]
     min_signal_strengths = [0.30, 0.45, 0.60]
 
-    print("  [PolyfitGrid] GPU-scanning grid params…")
+    print("  [PolyfitGrid] MLX-scanning grid params…")
 
     indicator_combos = list(product(trend_windows, vol_windows))
     grid_combos = list(product(
@@ -425,59 +431,41 @@ def scan_polyfit_grid(
     poly_base_arr = base_indicators["PolyBasePred"].values
     dev_pct_arr = base_indicators["PolyDevPct"].values
 
-    # 收集所有 indicator set 的 trend/vol
-    all_dev_trend = []
-    all_vol_pct = []
-    ind_keys = []
-    for tw, vw in indicator_combos:
-        indicators = indicator_cache[(tw, vw)]
-        all_dev_trend.append(indicators["PolyDevTrend"].reindex(common_idx).values)
-        all_vol_pct.append(indicators["RollingVolPct"].reindex(common_idx).values)
-        ind_keys.append((tw, vw))
-    dev_trend_all = np.array(all_dev_trend)
-    vol_pct_all = np.array(all_vol_pct)
-
-    # 预构建 per-combo 数组
-    s1_bgp = np.array([p[0] for p in grid_combos])
-    s1_vs = np.array([p[1] for p in grid_combos])
-    s1_ts = np.array([p[2] for p in grid_combos])
-    s1_mgl = np.array([p[3] for p in grid_combos], dtype=np.int32)
-    s1_tpg = np.array([p[4] for p in grid_combos])
-    s1_slg = np.array([p[5] for p in grid_combos])
-    s1_psz = np.array([p[6] for p in grid_combos])
-    s1_psc = np.array([p[7] for p in grid_combos])
-    s1_mss = np.array([p[8] for p in grid_combos])
+    # 预构建 per-combo 参数数组
+    s1_bgp = np.array([p[0] for p in grid_combos], dtype=np.float64)
+    s1_vs = np.array([p[1] for p in grid_combos], dtype=np.float64)
+    s1_ts = np.array([p[2] for p in grid_combos], dtype=np.float64)
+    s1_mgl = np.array([p[3] for p in grid_combos], dtype=np.float64)
+    s1_tpg = np.array([p[4] for p in grid_combos], dtype=np.float64)
+    s1_slg = np.array([p[5] for p in grid_combos], dtype=np.float64)
+    s1_psz = np.array([p[6] for p in grid_combos], dtype=np.float64)
+    s1_psc = np.array([p[7] for p in grid_combos], dtype=np.float64)
+    s1_mss = np.array([p[8] for p in grid_combos], dtype=np.float64)
+    s1_cd = np.full(n_grid, 1.0, dtype=np.float64)
 
     results = []
 
-    if use_gpu:
-        # Tile 所有 grid 参数 n_ind 次
-        def _tile(arr):
-            return np.tile(arr, n_ind).astype(arr.dtype)
-        indicator_idx = np.repeat(np.arange(n_ind, dtype=np.int32), n_grid)
+    if use_mlx:
+        # MLX 路径：每个 indicator set 单独批量处理
+        for ii, (tw, vw) in enumerate(indicator_combos):
+            indicators = indicator_cache[(tw, vw)]
+            dt_arr = indicators["PolyDevTrend"].reindex(common_idx).values
+            vol_arr = indicators["RollingVolPct"].reindex(common_idx).values
 
-        entries_b, exits_b, sizes_b = generate_grid_signals_batch(
-            cl_arr, dev_pct_arr, dev_trend_all, vol_pct_all, poly_base_arr,
-            _tile(s1_bgp), _tile(s1_vs), _tile(s1_ts),
-            _tile(s1_tpg), _tile(s1_slg),
-            indicator_idx=indicator_idx,
-            max_grid_levels_arr=_tile(s1_mgl),
-            cooldown_days_arr=np.full(n_total, 1, dtype=np.int32),
-            min_signal_strength_arr=_tile(s1_mss),
-            position_size_arr=_tile(s1_psz),
-            position_sizing_coef_arr=_tile(s1_psc),
-        )
-        bt = run_backtest_batch(cl_arr, entries_b, exits_b, sizes_b,
-                                n_combos=n_total, open_=op_aligned, transposed=True)
-        for ii, (tw, vw) in enumerate(ind_keys):
+            bt = _grid_scan_mlx(
+                cl_arr, dev_pct_arr, dt_arr, vol_arr, poly_base_arr,
+                s1_bgp, s1_vs, s1_ts, s1_mgl, s1_tpg, s1_slg,
+                s1_psz, s1_psc, s1_mss, s1_cd,
+                max_holding_days=45, open_arr=op_aligned,
+            )
+
             for gi, (bgp, vs, ts, max_gl, tpg, slg, pos_sz, pos_coef, min_ss) in enumerate(grid_combos):
-                idx = ii * n_grid + gi
-                if int(bt[idx][4]) == 0:
+                if int(bt[gi][4]) == 0:
                     continue
                 results.append({
-                    "total_return": bt[idx][0], "sharpe_ratio": bt[idx][1],
-                    "max_drawdown": bt[idx][2], "calmar_ratio": bt[idx][3],
-                    "num_trades": int(bt[idx][4]), "win_rate": bt[idx][5],
+                    "total_return": bt[gi][0], "sharpe_ratio": bt[gi][1],
+                    "max_drawdown": bt[gi][2], "calmar_ratio": bt[gi][3],
+                    "num_trades": int(bt[gi][4]), "win_rate": bt[gi][5],
                     "trend_window_days": tw, "vol_window_days": vw,
                     "base_grid_pct": bgp, "volatility_scale": vs,
                     "trend_sensitivity": ts, "max_grid_levels": max_gl,
@@ -487,6 +475,7 @@ def scan_polyfit_grid(
                     "position_size": pos_sz, "position_sizing_coef": pos_coef,
                 })
     else:
+        # CPU 路径
         for tw, vw in indicator_combos:
             indicators = indicator_cache[(tw, vw)]
             for (bgp, vs, ts, max_gl, tpg, slg, pos_sz, pos_coef, min_ss) in grid_combos:

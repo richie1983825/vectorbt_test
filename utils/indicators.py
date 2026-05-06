@@ -1,6 +1,6 @@
 """技术指标计算模块。
 
-计算各类策略需要的技术指标，可选 GPU 加速（通过 CuPy）。
+计算各类策略需要的技术指标，可选 MLX（Apple Silicon GPU）加速。
 主要指标：
   - 滚动波动率（Rolling Volatility）
   - 偏离趋势（Deviation Trend）—— 偏离率的短期斜率
@@ -13,34 +13,41 @@
 import numpy as np
 import pandas as pd
 
-from .gpu import gpu, xp
+from .gpu import gpu, get_mlx
 
 
 def compute_rolling_volatility(close: pd.Series, window: int = 20) -> pd.Series:
     """计算滚动波动率（收益率的标准差）。
 
-    当 CuPy 可用时，使用 GPU 卷积代替 pandas rolling 以加速计算。
+    Apple Silicon 上使用 MLX 卷积加速，否则回退到 pandas rolling。
     使用样本标准差（除以 n-1），与 pandas .std() 行为一致。
     """
     returns = close.pct_change()
-    if gpu()["cupy_available"]:
-        cp = xp()
-        ret = cp.asarray(returns.values, dtype=cp.float64)
+    info = gpu()
+
+    if info["mlx_available"]:
+        mx = get_mlx()
+        ret = mx.array(returns.values.astype(np.float32))
         n = len(ret)
-        # 将 NaN 替换为 0，避免折叠积中出现 NaN
-        ret_clean = cp.nan_to_num(ret, nan=0.0)
+        ret_clean = mx.where(mx.isnan(ret), mx.array(0.0, dtype=mx.float32), ret)
         ret2_clean = ret_clean * ret_clean
-        ones = cp.ones(window, dtype=cp.float64)
-        # 用卷积计算滚动 sum，然后转样本标准差
-        sum_ret = cp.convolve(ret_clean, ones, mode="full")[:n]
-        sum_ret2 = cp.convolve(ret2_clean, ones, mode="full")[:n]
-        count = cp.clip(cp.arange(1, n + 1, dtype=cp.float64), 2.0, float(window))
+        ones = mx.ones((window,), dtype=mx.float32)
+        sum_ret = mx.convolve(ret_clean, ones, mode="full")[:n]
+        sum_ret2 = mx.convolve(ret2_clean, ones, mode="full")[:n]
+        count = mx.clip(mx.arange(1, n + 1, dtype=mx.float32),
+                        mx.array(2.0, dtype=mx.float32),
+                        mx.array(float(window), dtype=mx.float32))
         mean_ret = sum_ret / count
-        pop_var = cp.maximum(sum_ret2 / count - mean_ret * mean_ret, 0.0)
-        sample_var = pop_var * count / (count - 1.0)  # 总体方差 → 样本方差
-        result_arr = cp.sqrt(sample_var)
-        result_arr[:window] = cp.nan  # 前 window 个值无效
-        return pd.Series(cp.asnumpy(result_arr), index=returns.index)
+        pop_var = mx.maximum(sum_ret2 / count - mean_ret * mean_ret,
+                             mx.array(0.0, dtype=mx.float32))
+        sample_var = pop_var * count / (count - mx.array(1.0, dtype=mx.float32))
+        result_arr = mx.sqrt(sample_var)
+        result_arr = mx.where(
+            mx.arange(n, dtype=mx.float32) < mx.array(float(window), dtype=mx.float32),
+            mx.array(float('nan'), dtype=mx.float32), result_arr)
+        mx.eval(result_arr)
+        return pd.Series(np.array(result_arr).astype(np.float64), index=returns.index)
+
     return returns.rolling(window).std()
 
 
@@ -131,18 +138,10 @@ def compute_ma_switch_indicators(
 # PolyDevTrend 使用 EMA(diff) 而非斜率回归，对短期方向变化更敏感。
 # ══════════════════════════════════════════════════════════════════
 
-def compute_polyfit_baseline(
+def _compute_polyfit_baseline_cpu(
     close: np.ndarray, fit_window_days: int = 252,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """用滑动窗口线性回归计算基准线和斜率。
-
-    对每一天，用前 fit_window_days 根 bar 做最小二乘拟合 y=α+βx，
-    取拟合线在当前位置的预测值作为 PolyBasePred。
-
-    返回值：
-      pred:  [n] float64，多项式预测基准线
-      slope: [n] float64，拟合斜率（β）
-    """
+    """CPU: 滑动窗口线性回归 (Python for-loop fallback)。"""
     n = len(close)
     pred = np.full(n, np.nan, dtype=np.float64)
     slope = np.full(n, np.nan, dtype=np.float64)
@@ -156,7 +155,6 @@ def compute_polyfit_baseline(
     x_center = x - x_mean
     x_var = float((x_center ** 2).sum())
 
-    # 对每一天 i，用 [i-fit_window+1, i] 的 close 做线性回归
     for i in range(effective_fit_window - 1, n):
         y = close[i - effective_fit_window + 1: i + 1]
         if np.isnan(y).any():
@@ -164,11 +162,87 @@ def compute_polyfit_baseline(
         y_mean = float(y.mean())
         beta = float(np.dot(x_center, y - y_mean) / max(x_var, 1e-12))
         alpha = y_mean - beta * x_mean
-        # 预测值 = α + β * (x 的最后一个值)，即当前 bar
         pred[i] = alpha + beta * (effective_fit_window - 1)
         slope[i] = beta
 
     return pred, slope
+
+
+def _compute_polyfit_baseline_mlx(
+    close: np.ndarray, fit_window_days: int = 252,
+) -> tuple[np.ndarray, np.ndarray]:
+    """MLX GPU: 用卷积实现滑动窗口线性回归。
+
+    数学推导:
+      x = [0, 1, ..., w-1]
+      β = (w·Σxy - Σx·Σy) / (w·Σx² - (Σx)²)
+      α = (Σy - β·Σx) / w
+      pred = α + β·(w-1)
+
+    Σy = conv(close, ones(w))       — 滚动和
+    Σxy = conv(close, rev(x))       — 滚动加权和
+    """
+    import mlx.core as mx
+
+    n = len(close)
+    w = min(max(int(fit_window_days), 5), n - 1)
+    if n < w:
+        return np.full(n, np.nan, dtype=np.float64), np.full(n, np.nan, dtype=np.float64)
+
+    if np.isnan(close).any():
+        return _compute_polyfit_baseline_cpu(close, fit_window_days)
+
+    sum_x = float(w * (w - 1)) / 2.0
+    sum_x2 = float(w * (w - 1) * (2 * w - 1)) / 6.0
+    denom = float(w) * sum_x2 - sum_x * sum_x
+
+    close_f32 = mx.array(close.astype(np.float32))
+
+    ones = mx.ones((w,), dtype=mx.float32)
+    sum_y = mx.convolve(close_f32, ones, mode="full")[:n]
+
+    x_rev = mx.array(np.arange(w - 1, -1, -1, dtype=np.float32))
+    sum_xy = mx.convolve(close_f32, x_rev, mode="full")[:n]
+
+    w_f = mx.array(float(w), dtype=mx.float32)
+    sx_f = mx.array(sum_x, dtype=mx.float32)
+    denom_f = mx.array(denom, dtype=mx.float32)
+    wm1_f = mx.array(float(w - 1), dtype=mx.float32)
+
+    beta = (w_f * sum_xy - sx_f * sum_y) / denom_f
+    alpha = (sum_y - beta * sx_f) / w_f
+    pred = alpha + beta * wm1_f
+
+    valid = mx.arange(n, dtype=mx.float32) >= mx.array(float(w - 1), dtype=mx.float32)
+    nan_f = mx.array(float("nan"), dtype=mx.float32)
+    pred = mx.where(valid, pred, nan_f)
+    slope = mx.where(valid, beta, nan_f)
+
+    mx.eval(pred, slope)
+    return np.array(pred).astype(np.float64), np.array(slope).astype(np.float64)
+
+
+def compute_polyfit_baseline(
+    close: np.ndarray, fit_window_days: int = 252,
+) -> tuple[np.ndarray, np.ndarray]:
+    """用滑动窗口线性回归计算基准线和斜率。
+
+    对每一天，用前 fit_window_days 根 bar 做最小二乘拟合 y=α+βx，
+    取拟合线在当前位置的预测值作为 PolyBasePred。
+
+    Apple Silicon 上使用 MLX GPU 卷积加速，否则回退到 CPU Python 循环。
+
+    返回值：
+      pred:  [n] float64，多项式预测基准线
+      slope: [n] float64，拟合斜率（β）
+    """
+    n = len(close)
+    if gpu()["mlx_available"] and n > 10000:
+        try:
+            return _compute_polyfit_baseline_mlx(close, fit_window_days)
+        except Exception:
+            pass
+    return _compute_polyfit_baseline_cpu(close, fit_window_days)
 
 
 def compute_polyfit_deviation_trend(
@@ -237,7 +311,6 @@ def compute_polyfit_indicators(
     )
     data["RollingVolPct"] = compute_polyfit_volatility(close, vol_window_days)
 
-    # 过滤包含 NaN 的行（初始拟合窗口内的数据无效）
     feature_cols = [
         "PolyBasePred", "PolySlope", "PolyDevPct",
         "PolyDevTrend", "RollingVolPct",
@@ -269,7 +342,6 @@ def compute_polyfit_switch_indicators(
     df = compute_polyfit_indicators(close, fit_window_days, trend_window_days, vol_window_days)
     for mw in ma_windows:
         df[f"MA{mw}"] = close.rolling(mw, min_periods=mw).mean()
-    # 额外均线可能在开头引入 NaN，需再次 drop
     feature_cols = (
         ["PolyBasePred", "PolySlope", "PolyDevPct",
          "PolyDevTrend", "RollingVolPct"]

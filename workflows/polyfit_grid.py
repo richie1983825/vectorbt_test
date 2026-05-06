@@ -218,9 +218,9 @@ def run_grid_wf(close: pd.Series, open_: pd.Series | None = None,
 # 直接运行入口
 # ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    from utils.gpu import detect_gpu
+    from utils.gpu import gpu
     from utils.data import load_data
-    detect_gpu()
+    gpu()
     print("Loading data…")
     data = load_data("data/1d/512890.SH_hfq.parquet")
     close = data["Close"]

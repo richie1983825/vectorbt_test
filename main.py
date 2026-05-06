@@ -15,7 +15,7 @@ import vectorbt as vbt
 
 warnings.filterwarnings("ignore")
 
-from utils.gpu import detect_gpu, print_gpu_info
+from utils.gpu import gpu, print_gpu_info
 from utils.data import load_data
 from utils.indicators import compute_polyfit_base_only, add_trend_vol_indicators, compute_polyfit_switch_indicators
 from utils.walkforward import generate_monthly_windows
@@ -190,7 +190,7 @@ def _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, swit
 
 if __name__ == "__main__":
     os.makedirs(REPORTS_DIR, exist_ok=True)
-    gpu_info = detect_gpu(); print_gpu_info(gpu_info)
+    gpu_info = gpu(); print_gpu_info()
     _t0_total = time.time()
 
     print("Loading data…")

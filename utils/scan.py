@@ -32,7 +32,7 @@ def indicator_and_scan(
 ) -> pd.DataFrame:
     """网格策略通用参数扫描。
 
-    对给定的参数候选集做全排列扫描。当 CuPy 可用且 signal_batch_fn 不为 None 时：
+    对给定的参数候选集做全排列扫描。当 MLX 可用且 signal_batch_fn 不为 None 时：
       - 同一 MA 窗口下，所有参数组合的指标数据相同
       - 批量信号生成 + 批量回测（GPU）
 
@@ -57,7 +57,7 @@ def indicator_and_scan(
     )
     results = []
     count = 0
-    use_gpu = gpu()["cupy_available"]
+    use_gpu = gpu()["mlx_available"]
 
     # 准备 numpy 版本的 Open 数据（GPU 路径用）
     open_arr = open_.values if open_ is not None else None
@@ -74,7 +74,7 @@ def indicator_and_scan(
         ))
 
         if use_gpu and signal_batch_fn is not None:
-            # ── GPU 路径：批量信号生成 + 批量回测 ──
+            # ── GPU 路径：批量信号生成 + 批量回测（MLX）──
             bgp_a = np.array([p[0] for p in param_combos])
             vs_a = np.array([p[1] for p in param_combos])
             ts_a = np.array([p[2] for p in param_combos])

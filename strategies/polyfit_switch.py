@@ -13,7 +13,7 @@
   - Switch 模式（趋势追踪）：当价格连续横盘后在基线上方且偏离超过阈值时激活，
     使用快慢均线金叉入场 + 最高价回撤追踪止损离场。
 
-GPU 加速：通过 CuPy RawKernel 将多组参数组合的信号生成一次性在 GPU 上完成。
+GPU 加速：MLX（Apple Silicon）向量化批量回测。
 """
 
 from itertools import product
@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from utils.backtest import run_backtest, run_backtest_batch
-from utils.gpu import xp, gpu
+from utils.gpu import gpu
 from utils.indicators import compute_polyfit_switch_indicators
 
 
@@ -1225,644 +1225,10 @@ def generate_grid_priority_switch_signals_v8(
     return sw_entries, sw_exits, sw_sizes
 
 
-# ══════════════════════════════════════════════════════════════════
-# GPU 批量信号生成 — CuPy RawKernel (v4)
-#
-# v4 改动：
-#   - 移除独立 Switch IDLE 入场，仅在 Grid TP 时通过趋势确认切换
-#   - Switch 离场：ATR Chandelier + 量能衰竭 + MA 死叉 + Grid 回退
-# ══════════════════════════════════════════════════════════════════
-
-_polyfit_switch_kernel = None
-
-_POLYFIT_SWITCH_KERNEL_CODE = r"""
-extern "C" __global__ void polyfit_switch_signals_kernel_v4(
-    const double* __restrict__ close,
-    const double* __restrict__ dev_pct,
-    const double* __restrict__ dev_trend_all,
-    const double* __restrict__ vol_pct_all,
-    const int* __restrict__ indicator_idx,
-    const double* __restrict__ poly_base,
-    const double* __restrict__ ma_all,
-    const int* __restrict__ fast_ma_idx,
-    const int* __restrict__ slow_ma_idx,
-    const int* __restrict__ ma5_idx,
-    const int* __restrict__ ma10_idx,
-    const int* __restrict__ ma20_idx,
-    const double* __restrict__ atr_arr,
-    const double* __restrict__ vol_ema_arr,
-    const double* __restrict__ volume,
-    const double* __restrict__ base_grid_pct,
-    const double* __restrict__ volatility_scale,
-    const double* __restrict__ trend_sensitivity,
-    const double* __restrict__ take_profit_grid,
-    const double* __restrict__ stop_loss_grid,
-    const double* __restrict__ trend_entry_dp,
-    const double* __restrict__ trend_confirm_dp_slope,
-    const double* __restrict__ trend_confirm_vol,
-    const double* __restrict__ trend_atr_mult,
-    const double* __restrict__ trend_vol_climax,
-    const int* __restrict__ trend_decline_days,
-    const double* __restrict__ switch_trailing_stop,
-    const int* __restrict__ max_grid_levels,
-    const int* __restrict__ cooldown_days,
-    const double* __restrict__ min_signal_strength,
-    const double* __restrict__ position_size,
-    const double* __restrict__ position_sizing_coef,
-    bool* __restrict__ entries,
-    bool* __restrict__ exits,
-    double* __restrict__ sizes,
-    int n_bars,
-    int n_combos,
-    int n_padded,
-    int max_holding_days
-) {
-    int combo_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (combo_idx >= n_combos) return;
-
-    int iset = indicator_idx[combo_idx];
-
-    double bgp = base_grid_pct[combo_idx];
-    double vs = volatility_scale[combo_idx];
-    double ts = trend_sensitivity[combo_idx];
-    double tpg = take_profit_grid[combo_idx];
-    double slg = stop_loss_grid[combo_idx];
-    double tedp = trend_entry_dp[combo_idx];
-    double tcds = trend_confirm_dp_slope[combo_idx];
-    double tcv = trend_confirm_vol[combo_idx];
-    double tam = trend_atr_mult[combo_idx];
-    double tvc = trend_vol_climax[combo_idx];
-    int tddecl = trend_decline_days[combo_idx];
-    double sw_ts = switch_trailing_stop[combo_idx];
-    int fi = fast_ma_idx[combo_idx];
-    int si = slow_ma_idx[combo_idx];
-    int m5i = ma5_idx[combo_idx];
-    int m10i = ma10_idx[combo_idx];
-    int m20i = ma20_idx[combo_idx];
-    int mgl = max_grid_levels[combo_idx];
-    int cd = cooldown_days[combo_idx];
-    double mss = min_signal_strength[combo_idx];
-    double ps = position_size[combo_idx];
-    double psc = position_sizing_coef[combo_idx];
-
-    // v4 状态机
-    int position_mode = 0;       // 0=idle, 1=grid, 2=switch
-    int entry_bar = -1;
-    int entry_level = 1;
-    double entry_grid_step = -1.0;
-    double entry_close_price = 0.0 / 0.0;
-    int cooldown = 0;
-    double switch_peak = 0.0;
-    double prev_ma5 = 0.0, prev_ma10 = 0.0;
-    double prev_dp_k = 0.0 / 0.0;  // NaN
-    int decline_count_k = 0;
-
-    for (int i = 0; i < n_bars; i++) {
-        double cl = close[i];
-        double dp = dev_pct[i];
-        double dt = dev_trend_all[iset * n_bars + i];
-        double vp = vol_pct_all[iset * n_bars + i];
-        double pb = poly_base[i];
-        double fma = ma_all[fi * n_bars + i];
-        double sma = ma_all[si * n_bars + i];
-        double m5 = ma_all[m5i * n_bars + i];
-        double m10 = ma_all[m10i * n_bars + i];
-        double m20 = ma_all[m20i * n_bars + i];
-
-        if (isnan(cl) || isnan(dp) || isnan(dt) || isnan(vp)
-            || isnan(pb) || isnan(fma) || isnan(sma)
-            || isnan(m5) || isnan(m10) || isnan(m20)
-            || pb <= 0.0 || cl <= 0.0) {
-            prev_ma5 = m5; prev_ma10 = m10;
-            continue;
-        }
-
-        if (cooldown > 0) cooldown--;
-
-        double vol_mult = 1.0 + vs * fmax(vp, 0.0);
-        double dgs = bgp * (1.0 + ts * fabs(dt)) * vol_mult;
-        dgs = fmax(dgs, bgp * 0.3);
-
-        // ── IDLE: Grid 入场 ──
-        if (position_mode == 0) {
-            entry_bar = -1; entry_level = 1; entry_grid_step = -1.0;
-            entry_close_price = 0.0 / 0.0;
-
-            if (cooldown <= 0) {
-                double sig = fabs(dp) / fmax(dgs, 1e-9);
-                int el = (int)floor(sig);
-                el = el < 1 ? 1 : (el > mgl ? mgl : el);
-                double eth = -(double)el * dgs;
-                if (dp <= eth && sig >= mss) {
-                    double sz = fabs(dp) * (1.0 + fmax(vp, 0.0)) * psc;
-                    sz = sz > ps ? ps : (sz < 0.0 ? 0.0 : sz);
-                    if (sz > 0.0) {
-                        entries[i * n_padded + combo_idx] = true;
-                        sizes[i * n_padded + combo_idx] = sz;
-                        position_mode = 1;
-                        entry_bar = i; entry_level = el; entry_grid_step = dgs;
-                        entry_close_price = cl;
-                    }
-                }
-            }
-        }
-
-        // ── Grid 持仓 ──
-        else if (position_mode == 1) {
-            int hd = i - entry_bar;
-            bool hl = hd >= max_holding_days;
-            double rs = fmax(dgs, entry_grid_step);
-            if (entry_grid_step < 0.0 || isnan(entry_grid_step)) rs = dgs;
-            double tp_threshold = entry_level * rs * tpg;
-            double sl_threshold = entry_level * rs * slg;
-            if (hl || dp <= -sl_threshold) {
-                exits[i * n_padded + combo_idx] = true;
-                position_mode = 0;
-                cooldown = cd;
-            } else if (dp >= tedp) {
-                // ── 趋势确认 (dp 高于阈值，2 取 1 即触发) ──
-                int tscore = 0;
-                if (dt > tcds) tscore++;
-                if (!isnan(m5) && !isnan(m10) && m5 > m10) tscore++;
-
-                if (tscore >= 1) {
-                    position_mode = 2;
-                    entry_bar = i; entry_grid_step = fmax(bgp, 1e-9);
-                    switch_peak = cl;
-                } else if (dp >= tp_threshold) {
-                    // dp 已达止盈位但趋势未确认 → 正常 Grid 止盈离场
-                    exits[i * n_padded + combo_idx] = true;
-                    position_mode = 0;
-                    cooldown = cd;
-                }
-            }
-        }
-
-        // ── Switch 持仓 (v4: dp连跌→ATR→量能→死叉→Grid回退) ──
-        else if (position_mode == 2) {
-            // Layer 0: dp 连续下跌 N 天 → 趋势逆转
-            if (tddecl > 0 && decline_count_k >= tddecl) {
-                exits[i * n_padded + combo_idx] = true;
-                position_mode = 0;
-                switch_peak = 0.0;
-                cooldown = cd;
-                decline_count_k = 0;
-            } else {
-            // Layer 1: ATR Chandelier trail
-            bool trail_exit = false;
-            if (atr_arr != NULL && atr_arr[i] > 0.0) {
-                trail_exit = cl <= switch_peak - tam * atr_arr[i];
-            } else {
-                trail_exit = cl <= switch_peak * (1.0 - sw_ts);
-            }
-
-            // Layer 2: volume climax
-            bool vol_climax = false;
-            if (volume != NULL && vol_ema_arr != NULL && i > 0) {
-                double rv = volume[i] / fmax(vol_ema_arr[i], 1e-9);
-                vol_climax = rv > tvc && cl > close[i-1];
-            }
-
-            // Layer 3: MA death cross
-            bool death_cross = false;
-            if (!isnan(m5) && !isnan(m10) && !isnan(prev_ma5) && !isnan(prev_ma10)) {
-                death_cross = m5 < m10 && prev_ma5 >= prev_ma10;
-            }
-
-            if (trail_exit || vol_climax || death_cross) {
-                exits[i * n_padded + combo_idx] = true;
-                position_mode = 0;
-                switch_peak = 0.0;
-                cooldown = cd;
-            } else if (dp < 0.0) {
-                // Layer 4: Grid fallback
-                double sig = fabs(dp) / fmax(dgs, 1e-9);
-                int el = (int)floor(sig);
-                el = el < 1 ? 1 : (el > mgl ? mgl : el);
-                double eth = -(double)el * dgs;
-                if (dp <= eth && sig >= mss) {
-                    position_mode = 1;
-                    entry_bar = i; entry_level = el; entry_grid_step = dgs;
-                    entry_close_price = cl;
-                    switch_peak = 0.0;
-                } else {
-                    exits[i * n_padded + combo_idx] = true;
-                    position_mode = 0;
-                    switch_peak = 0.0;
-                    cooldown = cd;
-                }
-            } else {
-                switch_peak = fmax(switch_peak, cl);
-            }
-        }
-
-            }  // end else (decline_count < tddecl)
-
-        // dp 连续下跌追踪
-        if (!isnan(prev_dp_k) && !isnan(dp)) {
-            if (dp < prev_dp_k) decline_count_k++;
-            else decline_count_k = 0;
-        }
-        prev_dp_k = dp;
-        prev_ma5 = m5; prev_ma10 = m10;
-    }
-
-    if (position_mode != 0) {
-        exits[(n_bars - 1) * n_padded + combo_idx] = true;
-    }
-}
-"""
 
 
 # ══════════════════════════════════════════════════════════════════
-# GPU kernel v5 — Grid-priority Switch
-# ══════════════════════════════════════════════════════════════════
-
-_polyfit_switch_kernel_v5 = None
-
-_POLYFIT_SWITCH_V5_KERNEL = r"""
-extern "C" __global__ void polyfit_switch_grid_priority_kernel(
-    const double* __restrict__ close,
-    const double* __restrict__ dev_pct,
-    const double* __restrict__ dev_trend,
-    const bool* __restrict__ grid_entries,
-    const bool* __restrict__ grid_exits,
-    const double* __restrict__ ma20_arr,
-    const double* __restrict__ ma60_arr,
-    const double* __restrict__ atr_arr,
-    const double* __restrict__ vol_ema_arr,
-    const double* __restrict__ volume,
-    const double* __restrict__ trend_entry_dp,
-    const double* __restrict__ trend_confirm_slope,
-    const double* __restrict__ trend_atr_mult,
-    const double* __restrict__ trend_vol_climax,
-    const int* __restrict__ trend_decline_days,
-    bool* __restrict__ sw_entries,
-    bool* __restrict__ sw_exits,
-    int n_bars,
-    int n_combos,
-    int n_padded
-) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= n_combos) return;
-
-    double tedp = trend_entry_dp[c];
-    double tcds = trend_confirm_slope[c];
-    double tam = trend_atr_mult[c];
-    double tvc = trend_vol_climax[c];
-    int tddecl = trend_decline_days[c];
-
-    bool grid_in = false;
-    bool sw_in = false;
-    double sw_peak = 0.0;
-    double prev_dp = 0.0 / 0.0;
-    int decline = 0;
-    double prev_m20 = 0.0, prev_m60 = 0.0;
-
-    for (int i = 0; i < n_bars; i++) {
-        double dp = dev_pct[i]; double dt = dev_trend[i]; double cl = close[i];
-        double m20 = ma20_arr[i]; double m60 = ma60_arr[i];
-
-        if (isnan(dp) || isnan(dt) || isnan(cl) || cl <= 0.0) {
-            prev_m20 = m20; prev_m60 = m60; continue;
-        }
-
-        // Grid exits
-        if (grid_in && grid_exits[i]) grid_in = false;
-
-        // Grid entry = force Switch exit
-        if (grid_entries[i]) {
-            if (sw_in) { sw_exits[i * n_padded + c] = true; sw_in = false; sw_peak = 0.0; }
-            grid_in = true;
-            prev_m20 = m20; prev_m60 = m60; continue;
-        }
-
-        // Only if Grid idle
-        if (!grid_in) {
-            if (!sw_in) {
-                if (dp >= tedp) {
-                    bool cs = dt > tcds;
-                    bool cm = !isnan(m20) && !isnan(m60) && m20 > m60;
-                    if (cs || cm) {
-                        sw_entries[i * n_padded + c] = true;
-                        sw_in = true; sw_peak = cl; decline = 0;
-                    }
-                }
-            } else {
-                bool exit_now = false;
-                if (tddecl > 0 && decline >= tddecl) exit_now = true;
-                else if (atr_arr != NULL && atr_arr[i] > 0.0) {
-                    if (cl <= sw_peak - tam * atr_arr[i]) exit_now = true;
-                }
-                if (!exit_now && vol_ema_arr != NULL && volume != NULL && i > 0) {
-                    double rv = volume[i] / fmax(vol_ema_arr[i], 1e-9);
-                    if (rv > tvc && cl > close[i-1]) exit_now = true;
-                }
-                if (!exit_now && !isnan(m20) && !isnan(m60)
-                    && !isnan(prev_m20) && !isnan(prev_m60)
-                    && m20 < m60 && prev_m20 >= prev_m60) exit_now = true;
-
-                if (exit_now) {
-                    sw_exits[i * n_padded + c] = true;
-                    sw_in = false; sw_peak = 0.0;
-                } else {
-                    sw_peak = fmax(sw_peak, cl);
-                }
-            }
-        }
-
-        // dp decline tracking
-        if (!isnan(prev_dp) && !isnan(dp)) {
-            if (dp < prev_dp) decline++; else decline = 0;
-        }
-        prev_dp = dp; prev_m20 = m20; prev_m60 = m60;
-    }
-
-    if (sw_in) sw_exits[(n_bars - 1) * n_padded + c] = true;
-}
-"""
-
-def _get_polyfit_switch_kernel_v5():
-    global _polyfit_switch_kernel_v5
-    if _polyfit_switch_kernel_v5 is None:
-        cp = xp()
-        _polyfit_switch_kernel_v5 = cp.RawKernel(
-            _POLYFIT_SWITCH_V5_KERNEL, "polyfit_switch_grid_priority_kernel"
-        )
-    return _polyfit_switch_kernel_v5
-
-
-def generate_grid_priority_switch_batch(
-    close: np.ndarray,
-    dev_pct: np.ndarray,
-    dev_trend: np.ndarray,
-    grid_entries: np.ndarray,
-    grid_exits: np.ndarray,
-    ma20_arr: np.ndarray,
-    ma60_arr: np.ndarray,
-    high: np.ndarray | None = None,
-    low: np.ndarray | None = None,
-    volume: np.ndarray | None = None,
-    trend_entry_dp_arr: np.ndarray | None = None,
-    trend_confirm_slope_arr: np.ndarray | None = None,
-    trend_atr_mult_arr: np.ndarray | None = None,
-    trend_vol_climax_arr: np.ndarray | None = None,
-    trend_decline_days_arr: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """GPU 批量生成 Grid-priority Switch 信号。"""
-    cp = xp()
-    n_bars = len(close)
-    n_combos = len(trend_entry_dp_arr) if trend_entry_dp_arr is not None else 1
-
-    block_size = 256
-    grid_size = (n_combos + block_size - 1) // block_size
-    padded = grid_size * block_size
-
-    def _pad_f64(a):
-        result = cp.zeros(padded, dtype=cp.float64)
-        result[:n_combos] = cp.asarray(a, dtype=cp.float64)
-        return result
-
-    def _pad_i32(a):
-        result = cp.zeros(padded, dtype=cp.int32)
-        result[:n_combos] = cp.asarray(a, dtype=cp.int32)
-        return result
-
-    # Defaults
-    _tedp = trend_entry_dp_arr if trend_entry_dp_arr is not None else np.full(n_combos, 0.01)
-    _tcds = trend_confirm_slope_arr if trend_confirm_slope_arr is not None else np.full(n_combos, 0.0003)
-    _tam = trend_atr_mult_arr if trend_atr_mult_arr is not None else np.full(n_combos, 2.5)
-    _tvc = trend_vol_climax_arr if trend_vol_climax_arr is not None else np.full(n_combos, 3.0)
-    _tddecl = trend_decline_days_arr if trend_decline_days_arr is not None else np.full(n_combos, 3, dtype=np.int32)
-
-    # Pre-compute ATR & vol_ema
-    atr_arr = np.zeros(n_bars, dtype=np.float64)
-    if high is not None and low is not None:
-        alpha_a = 2.0 / 15.0; atr_ema = 0.0
-        for i in range(1, n_bars):
-            if np.isnan(high[i]) or np.isnan(low[i]) or np.isnan(close[i]) or np.isnan(close[i-1]): continue
-            tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
-            atr_ema = tr if i == 1 else alpha_a*tr + (1-alpha_a)*atr_ema
-            atr_arr[i] = atr_ema
-
-    vol_ema_arr = np.zeros(n_bars, dtype=np.float64)
-    if volume is not None:
-        alpha_v = 2.0/21.0; v_ema = float(volume[0]) if not np.isnan(volume[0]) else 0.0
-        vol_ema_arr[0] = v_ema
-        for i in range(1, n_bars):
-            if not np.isnan(volume[i]): v_ema = alpha_v*float(volume[i]) + (1-alpha_v)*v_ema
-            vol_ema_arr[i] = v_ema
-
-    # GPU arrays
-    close_d = cp.asarray(close, dtype=cp.float64)
-    dev_d = cp.asarray(dev_pct, dtype=cp.float64)
-    dt_d = cp.asarray(dev_trend, dtype=cp.float64)
-    ge_d = cp.asarray(grid_entries, dtype=cp.bool_)
-    gx_d = cp.asarray(grid_exits, dtype=cp.bool_)
-    m20_d = cp.asarray(ma20_arr, dtype=cp.float64)
-    m60_d = cp.asarray(ma60_arr, dtype=cp.float64)
-    atr_d = cp.asarray(atr_arr, dtype=cp.float64)
-    vema_d = cp.asarray(vol_ema_arr, dtype=cp.float64)
-    vol_d = cp.asarray(volume if volume is not None else np.zeros(n_bars), dtype=cp.float64)
-
-    tedp_d = _pad_f64(_tedp); tcds_d = _pad_f64(_tcds)
-    tam_d = _pad_f64(_tam); tvc_d = _pad_f64(_tvc)
-    tddecl_d = _pad_i32(_tddecl)
-
-    sw_e_d = cp.zeros(padded * n_bars, dtype=cp.bool_)
-    sw_x_d = cp.zeros(padded * n_bars, dtype=cp.bool_)
-
-    kernel = _get_polyfit_switch_kernel_v5()
-    kernel((grid_size,), (block_size,),
-           (close_d, dev_d, dt_d, ge_d, gx_d, m20_d, m60_d,
-            atr_d, vema_d, vol_d,
-            tedp_d, tcds_d, tam_d, tvc_d, tddecl_d,
-            sw_e_d, sw_x_d, n_bars, n_combos, padded))
-
-    sw_entries = cp.asnumpy(sw_e_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    sw_exits = cp.asnumpy(sw_x_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    return sw_entries, sw_exits
-
-
-def _get_polyfit_switch_kernel():
-    """原始 v4 kernel（已弃用，保留兼容）"""
-    global _polyfit_switch_kernel
-    if _polyfit_switch_kernel is None:
-        cp = xp()
-        _polyfit_switch_kernel = cp.RawKernel(
-            _POLYFIT_SWITCH_KERNEL_CODE, "polyfit_switch_signals_kernel_v4"
-        )
-    return _polyfit_switch_kernel
-
-
-def generate_polyfit_switch_signals_batch(
-    close: np.ndarray,
-    dev_pct: np.ndarray,
-    dev_trend_all: np.ndarray,
-    rolling_vol_pct_all: np.ndarray,
-    poly_base: np.ndarray,
-    ma_all: np.ndarray,             # [n_ma_windows, n_bars]
-    fast_ma_idx: np.ndarray,        # [n_combos] int32
-    slow_ma_idx: np.ndarray,        # [n_combos] int32
-    ma5_idx: np.ndarray,            # [n_combos] int32
-    ma10_idx: np.ndarray,           # [n_combos] int32
-    ma20_idx: np.ndarray,           # [n_combos] int32
-    base_grid_pcts: np.ndarray,
-    volatility_scales: np.ndarray,
-    trend_sensitivities: np.ndarray,
-    take_profit_grids: np.ndarray,
-    stop_loss_grids: np.ndarray,
-    switch_deviation_m1_arr: np.ndarray,       # unused in v4, kept for compat
-    switch_deviation_m2_arr: np.ndarray,       # unused in v4
-    switch_trailing_stop_arr: np.ndarray | None = None,  # fallback trailing stop
-    # ── v4 新参数 ──
-    trend_entry_dp_arr: np.ndarray | None = None,
-    trend_confirm_dp_slope_arr: np.ndarray | None = None,
-    trend_confirm_vol_arr: np.ndarray | None = None,
-    trend_atr_mult_arr: np.ndarray | None = None,
-    trend_vol_climax_arr: np.ndarray | None = None,
-    trend_decline_days_arr: np.ndarray | None = None,
-    # ── v4 预计算数据 ──
-    high: np.ndarray | None = None,
-    low: np.ndarray | None = None,
-    volume: np.ndarray | None = None,
-    # ── 其他 ──
-    flat_wait_days_arr: np.ndarray | None = None,  # ignored
-    indicator_idx: np.ndarray | None = None,
-    max_grid_levels_arr: np.ndarray | None = None,
-    max_holding_days: int = 45,
-    cooldown_days_arr: np.ndarray | None = None,
-    min_signal_strength_arr: np.ndarray | None = None,
-    position_size_arr: np.ndarray | None = None,
-    position_sizing_coef_arr: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """GPU 批量生成 Polyfit-Switch v4 信号。"""
-    cp = xp()
-    n_bars = len(close)
-    n_combos = len(base_grid_pcts)
-
-    if dev_trend_all.ndim == 1:
-        dev_trend_all = dev_trend_all.reshape(1, -1)
-    if rolling_vol_pct_all.ndim == 1:
-        rolling_vol_pct_all = rolling_vol_pct_all.reshape(1, -1)
-    n_indicator_sets = dev_trend_all.shape[0]
-
-    if indicator_idx is None:
-        indicator_idx = np.zeros(n_combos, dtype=np.int32)
-
-    block_size = 256
-    grid_size = (n_combos + block_size - 1) // block_size
-    padded = grid_size * block_size
-
-    def _pad_f64(a):
-        result = cp.zeros(padded, dtype=cp.float64)
-        result[:n_combos] = cp.asarray(a, dtype=cp.float64)
-        if padded > n_combos:
-            result[n_combos:] = cp.nan
-        return result
-
-    def _pad_i32(a):
-        result = cp.zeros(padded, dtype=cp.int32)
-        result[:n_combos] = cp.asarray(a, dtype=cp.int32)
-        return result
-
-    # 默认值
-    _mgl = max_grid_levels_arr if max_grid_levels_arr is not None else np.full(n_combos, 3, dtype=np.int32)
-    _cd  = cooldown_days_arr if cooldown_days_arr is not None else np.full(n_combos, 1, dtype=np.int32)
-    _mss = min_signal_strength_arr if min_signal_strength_arr is not None else np.full(n_combos, 0.45, dtype=np.float64)
-    _str = switch_trailing_stop_arr if switch_trailing_stop_arr is not None else np.full(n_combos, 0.05, dtype=np.float64)
-    _ps  = position_size_arr if position_size_arr is not None else np.full(n_combos, 0.5, dtype=np.float64)
-    _psc = position_sizing_coef_arr if position_sizing_coef_arr is not None else np.full(n_combos, 30.0, dtype=np.float64)
-    _tedp = trend_entry_dp_arr if trend_entry_dp_arr is not None else np.full(n_combos, 0.0, dtype=np.float64)
-    _tcds = trend_confirm_dp_slope_arr if trend_confirm_dp_slope_arr is not None else np.full(n_combos, 0.0003, dtype=np.float64)
-    _tcv = trend_confirm_vol_arr if trend_confirm_vol_arr is not None else np.full(n_combos, 1.2, dtype=np.float64)
-    _tam = trend_atr_mult_arr if trend_atr_mult_arr is not None else np.full(n_combos, 2.5, dtype=np.float64)
-    _tvc = trend_vol_climax_arr if trend_vol_climax_arr is not None else np.full(n_combos, 3.0, dtype=np.float64)
-    _tddecl = trend_decline_days_arr if trend_decline_days_arr is not None else np.full(n_combos, 0, dtype=np.int32)
-
-    # Pre-compute ATR (percentage)
-    atr_arr = np.zeros(n_bars, dtype=np.float64)
-    if high is not None and low is not None:
-        alpha_a = 2.0 / 15.0  # ~14-day EMA
-        atr_ema = 0.0
-        for i in range(1, n_bars):
-            if (np.isnan(high[i]) or np.isnan(low[i]) or np.isnan(close[i])
-                or np.isnan(close[i-1])):
-                continue
-            tr = max(high[i] - low[i],
-                     abs(high[i] - close[i-1]),
-                     abs(low[i] - close[i-1]))
-            if i == 1:
-                atr_ema = tr
-            else:
-                atr_ema = alpha_a * tr + (1.0 - alpha_a) * atr_ema
-            atr_arr[i] = atr_ema
-
-    # Pre-compute vol EMA
-    vol_ema_arr = np.zeros(n_bars, dtype=np.float64)
-    if volume is not None:
-        alpha_v = 2.0 / 21.0
-        v_ema = float(volume[0]) if not np.isnan(volume[0]) else 0.0
-        vol_ema_arr[0] = v_ema
-        for i in range(1, n_bars):
-            if not np.isnan(volume[i]):
-                v_ema = alpha_v * float(volume[i]) + (1.0 - alpha_v) * v_ema
-            vol_ema_arr[i] = v_ema
-
-    # Pad per-combo arrays
-    bgp_d = _pad_f64(base_grid_pcts); vs_d = _pad_f64(volatility_scales)
-    ts_d = _pad_f64(trend_sensitivities); tpg_d = _pad_f64(take_profit_grids)
-    slg_d = _pad_f64(stop_loss_grids)
-    m1_d = _pad_f64(switch_deviation_m1_arr); m2_d = _pad_f64(switch_deviation_m2_arr)
-    tedp_d = _pad_f64(_tedp)
-    tcds_d = _pad_f64(_tcds); tcv_d = _pad_f64(_tcv)
-    tam_d = _pad_f64(_tam); tvc_d = _pad_f64(_tvc)
-    tddecl_d = _pad_i32(_tddecl)
-    str_d = _pad_f64(_str)
-    fi_d = _pad_i32(fast_ma_idx); si_d = _pad_i32(slow_ma_idx)
-    m5i_d = _pad_i32(ma5_idx); m10i_d = _pad_i32(ma10_idx); m20i_d = _pad_i32(ma20_idx)
-    mgl_d = _pad_i32(_mgl); cd_d = _pad_i32(_cd)
-    mss_d = _pad_f64(_mss); ps_d = _pad_f64(_ps); psc_d = _pad_f64(_psc)
-    iset_d = _pad_i32(indicator_idx)
-
-    # GPU arrays
-    close_d = cp.asarray(close, dtype=cp.float64)
-    dev_d = cp.asarray(dev_pct, dtype=cp.float64)
-    trend_all_d = cp.asarray(dev_trend_all.ravel(), dtype=cp.float64)
-    vol_all_d = cp.asarray(rolling_vol_pct_all.ravel(), dtype=cp.float64)
-    pb_d = cp.asarray(poly_base, dtype=cp.float64)
-    ma_d = cp.asarray(ma_all.ravel(), dtype=cp.float64)
-    atr_d = cp.asarray(atr_arr, dtype=cp.float64)
-    vema_d = cp.asarray(vol_ema_arr, dtype=cp.float64)
-    vol_d = cp.asarray(volume if volume is not None else np.zeros(n_bars), dtype=cp.float64)
-
-    entries_d = cp.zeros(padded * n_bars, dtype=cp.bool_)
-    exits_d = cp.zeros(padded * n_bars, dtype=cp.bool_)
-    sizes_d = cp.zeros(padded * n_bars, dtype=cp.float64)
-
-    kernel = _get_polyfit_switch_kernel()
-    kernel(
-        (grid_size,), (block_size,),
-        (
-            close_d, dev_d, trend_all_d, vol_all_d, iset_d,
-            pb_d, ma_d, fi_d, si_d, m5i_d, m10i_d, m20i_d,
-            atr_d, vema_d, vol_d,
-            bgp_d, vs_d, ts_d, tpg_d, slg_d,
-            tedp_d, tcds_d, tcv_d, tam_d, tvc_d, tddecl_d, str_d,
-            mgl_d, cd_d, mss_d, ps_d, psc_d,
-            entries_d, exits_d, sizes_d,
-            n_bars, n_combos, padded, max_holding_days,
-        ),
-    )
-
-    entries = cp.asnumpy(entries_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    exits = cp.asnumpy(exits_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    sizes = cp.asnumpy(sizes_d).reshape(n_bars, padded)[:, :n_combos].copy()
-    return entries, exits, sizes
-
-
-# ══════════════════════════════════════════════════════════════════
-# 两阶段参数扫描（GPU）
+# 两阶段参数扫描（MLX）
 # ══════════════════════════════════════════════════════════════════
 
 def scan_polyfit_switch_two_stage(close: pd.Series,
@@ -1870,16 +1236,16 @@ def scan_polyfit_switch_two_stage(close: pd.Series,
     """两阶段扫描：Stage 1 复用 Polyfit-Grid 扫描，Stage 2 扫描 Switch 参数。
 
     Stage 1: 调用 scan_polyfit_grid() 获取纯 Grid 最优参数（与 Polyfit-Grid 策略一致）
-    Stage 2: 固定最优 Grid 参数，GPU 批量扫描 Switch 参数（m1/m2/trailing_stop/MA）
+    Stage 2: 固定最优 Grid 参数，CPU 逐组合生成信号 + MLX 批量回测
 
     Args:
         open_: 可选，开盘价序列，传入则使用 next-bar Open 成交
     """
-    use_gpu = gpu()["cupy_available"]
+    use_mlx = gpu()["mlx_available"]
     open_arr = open_.values if open_ is not None else None
 
     # ── Stage 1: 复用 Polyfit-Grid 扫描（纯Grid，确保与Polyfit-Grid策略一致） ──
-    print("  [PolyfitSwitch Stage 1] Reusing Polyfit-Grid scan…")
+    print("  [PolyfitSwitch Stage 1] Reusing Polyfit-Grid scan...")
     from strategies.polyfit_grid import scan_polyfit_grid as _scan_grid
     stage1_df = _scan_grid(close, open_=open_)
     if stage1_df.empty:
@@ -1905,7 +1271,7 @@ def scan_polyfit_switch_two_stage(close: pd.Series,
           f"min_ss={best_min_ss:.2f} ret={best_grid['total_return']:.1%}")
 
     # ── Stage 2: Switch 参数扫描（Grid 参数固定） ──
-    print("  [PolyfitSwitch Stage 2] Scanning switch params (grid fixed)…")
+    print("  [PolyfitSwitch Stage 2] Scanning switch params (grid fixed)...")
 
     switch_m1_vals = [0.02, 0.03, 0.04, 0.05]
     switch_m2_vals = [0.005, 0.01, 0.015, 0.02]
@@ -1914,7 +1280,6 @@ def scan_polyfit_switch_two_stage(close: pd.Series,
     switch_slow_vals = [10, 20, 60]
 
     all_ma_windows2 = sorted(set(switch_fast_vals + switch_slow_vals))
-    ma_to_idx2 = {w: i for i, w in enumerate(all_ma_windows2)}
 
     switch_combos = []
     for sw_m1, sw_m2, sw_tr, sw_fast, sw_slow in product(
@@ -1932,74 +1297,82 @@ def scan_polyfit_switch_two_stage(close: pd.Series,
         trend_window_days=best_tw, vol_window_days=best_vw,
     )
     common_idx = indicators.index
+    if len(common_idx) == 0:
+        return pd.DataFrame()
     cl_aligned = close.loc[common_idx]
     cl_arr = cl_aligned.values
     poly_base_arr = indicators["PolyBasePred"].values
     dev_pct_arr = indicators["PolyDevPct"].values
     dev_trend_arr = indicators["PolyDevTrend"].values
     vol_arr = indicators["RollingVolPct"].values
-    ma_all2 = np.array([indicators[f"MA{mw}"].values for mw in all_ma_windows2])
 
     n_switch = len(switch_combos)
-    bgp_a = np.full(n_switch, best_bgp)
-    vs_a = np.full(n_switch, best_vs)
-    ts_a = np.full(n_switch, best_ts)
-    tpg_a = np.full(n_switch, best_tpg)
-    slg_a = np.full(n_switch, best_slg)
-    m1_a = np.array([c[0] for c in switch_combos])
-    m2_a = np.array([c[1] for c in switch_combos])
-    str_a = np.array([c[2] for c in switch_combos])
-    fi_a = np.array([ma_to_idx2[c[3]] for c in switch_combos], dtype=np.int32)
-    si_a = np.array([ma_to_idx2[c[4]] for c in switch_combos], dtype=np.int32)
-
     stage2_results = []
 
-    # Stage 2 GPU 批量：Grid 参数固定，Switch 参数变化
-    mgl_a = np.full(n_switch, best_max_gl, dtype=np.int32)
-    cd_a = np.full(n_switch, 1, dtype=np.int32)
-    mss_a = np.full(n_switch, best_min_ss)
-    ps_a = np.full(n_switch, best_pos_sz)
-    psc_a = np.full(n_switch, best_pos_coef)
-
-    if use_gpu:
-        entries_b, exits_b, sizes_b = generate_polyfit_switch_signals_batch(
-            cl_arr, dev_pct_arr, dev_trend_arr, vol_arr, poly_base_arr,
-            ma_all2, fi_a, si_a,
-            bgp_a, vs_a, ts_a, tpg_a, slg_a,
-            m1_a, m2_a, str_a,
-            max_grid_levels_arr=mgl_a,
-            max_holding_days=45,
-            cooldown_days_arr=cd_a,
-            min_signal_strength_arr=mss_a,
-            position_size_arr=ps_a,
-            position_sizing_coef_arr=psc_a,
-        )
+    if use_mlx:
+        # MLX 路径: CPU 逐组合生成信号 + MLX 批量回测
         op_aligned = open_arr[close.index.get_indexer(common_idx)] if open_arr is not None else None
-        bt = run_backtest_batch(cl_arr, entries_b, exits_b, sizes_b, n_combos=n_switch, transposed=True,
-                                open_=op_aligned)
+
+        # 先批量生成所有信号（CPU 循环，~2000 combos 可接受）
+        all_entries = []
+        all_exits = []
+        all_sizes = []
+        valid_indices = []
         for idx, (sw_m1, sw_m2, sw_tr, sw_fast, sw_slow) in enumerate(switch_combos):
-            if int(bt[idx][4]) == 0:
+            ma_fast_arr = indicators[f"MA{sw_fast}"].values
+            ma_slow_arr = indicators[f"MA{sw_slow}"].values
+            entries, exits, sizes, _modes = generate_polyfit_switch_signals(
+                cl_arr, dev_pct_arr, dev_trend_arr, vol_arr,
+                poly_base_arr, ma_fast_arr, ma_slow_arr,
+                base_grid_pct=best_bgp, volatility_scale=best_vs,
+                trend_sensitivity=best_ts, max_grid_levels=best_max_gl,
+                take_profit_grid=best_tpg, stop_loss_grid=best_slg,
+                max_holding_days=45, cooldown_days=1,
+                min_signal_strength=best_min_ss,
+                position_size=best_pos_sz,
+                position_sizing_coef=best_pos_coef,
+                switch_deviation_m1=sw_m1,
+                switch_deviation_m2=sw_m2,
+                switch_trailing_stop=sw_tr,
+            )
+            if entries.sum() == 0:
                 continue
-            stage2_results.append({
-                "total_return": bt[idx][0], "sharpe_ratio": bt[idx][1],
-                "max_drawdown": bt[idx][2], "calmar_ratio": bt[idx][3],
-                "num_trades": int(bt[idx][4]), "win_rate": bt[idx][5],
-                "fit_window_days": 252,
-                "trend_window_days": best_tw,
-                "vol_window_days": best_vw,
-                "base_grid_pct": best_bgp, "volatility_scale": best_vs,
-                "trend_sensitivity": best_ts, "max_grid_levels": best_max_gl,
-                "take_profit_grid": best_tpg, "stop_loss_grid": best_slg,
-                "max_holding_days": 45, "cooldown_days": 1,
-                "min_signal_strength": best_min_ss,
-                "position_size": best_pos_sz,
-                "position_sizing_coef": best_pos_coef,
-                "switch_deviation_m1": sw_m1,
-                "switch_deviation_m2": sw_m2,
-                "switch_trailing_stop": sw_tr,
-                "switch_fast_ma": sw_fast, "switch_slow_ma": sw_slow,
-            })
+            all_entries.append(entries)
+            all_exits.append(exits)
+            all_sizes.append(sizes)
+            valid_indices.append(idx)
+
+        if all_entries:
+            entries_b = np.array(all_entries)
+            exits_b = np.array(all_exits)
+            sizes_b = np.array(all_sizes)
+            bt = run_backtest_batch(cl_arr, entries_b, exits_b, sizes_b,
+                                    n_combos=len(valid_indices), open_=op_aligned)
+            for bi, orig_idx in enumerate(valid_indices):
+                if int(bt[bi][4]) == 0:
+                    continue
+                sw_m1, sw_m2, sw_tr, sw_fast, sw_slow = switch_combos[orig_idx]
+                stage2_results.append({
+                    "total_return": bt[bi][0], "sharpe_ratio": bt[bi][1],
+                    "max_drawdown": bt[bi][2], "calmar_ratio": bt[bi][3],
+                    "num_trades": int(bt[bi][4]), "win_rate": bt[bi][5],
+                    "fit_window_days": 252,
+                    "trend_window_days": best_tw,
+                    "vol_window_days": best_vw,
+                    "base_grid_pct": best_bgp, "volatility_scale": best_vs,
+                    "trend_sensitivity": best_ts, "max_grid_levels": best_max_gl,
+                    "take_profit_grid": best_tpg, "stop_loss_grid": best_slg,
+                    "max_holding_days": 45, "cooldown_days": 1,
+                    "min_signal_strength": best_min_ss,
+                    "position_size": best_pos_sz,
+                    "position_sizing_coef": best_pos_coef,
+                    "switch_deviation_m1": sw_m1,
+                    "switch_deviation_m2": sw_m2,
+                    "switch_trailing_stop": sw_tr,
+                    "switch_fast_ma": sw_fast, "switch_slow_ma": sw_slow,
+                })
     else:
+        # CPU 路径: 逐组合生成信号 + VectorBT 回测
         cl_s = close.loc[common_idx]
         op_s = open_.reindex(common_idx) if open_ is not None else None
         for (sw_m1, sw_m2, sw_tr, sw_fast, sw_slow) in switch_combos:
