@@ -826,3 +826,155 @@ def generate_polyfit_grid_report(
         "plots": saved_plots,
     }
 
+
+def generate_polyfit_switch_intra_report(
+    df, close, entries, exits, sizes, entry_modes,
+    params, name="Polyfit-Switch-Intra", reports_dir="reports",
+    open_=None, intraday_result=None,
+):
+    """Polyfit-Switch + 日内限价单增强报告，含 T+0 每日盈亏子图。"""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    idx = close.index
+    fill_price = open_.shift(-1).reindex(idx) if open_ is not None else close
+    safe_name = name.replace(" ", "_")
+    out_dir = f"{reports_dir}/{safe_name}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    pf_full = vbt.Portfolio.from_signals(
+        fill_price, entries=pd.Series(entries, index=idx),
+        exits=pd.Series(exits, index=idx),
+        size=pd.Series(sizes, index=idx),
+        size_type="percent", init_cash=1.0, freq="D",
+    )
+    base_ret = pf_full.total_return()
+    bh_ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
+
+    if intraday_result is not None:
+        intra_ret = intraday_result["intraday_total_return"]
+        total_ret = intraday_result["total_return"]
+        excess = intraday_result["excess_return"]
+        i_stats = intraday_result["intraday_stats"]
+        print(f"\n  {'='*60}")
+        print(f"  {name} — 日内限价单增强")
+        print(f"  {'='*60}")
+        print(f"  BH return:          {bh_ret:+.2%}")
+        print(f"  Switch基准(开盘价):  {base_ret:+.2%}  (α={base_ret-bh_ret:+.2%})")
+        print(f"  日内增量:            {intra_ret:+.2%}")
+        print(f"  总收益(基准+日内):    {total_ret:+.2%}  (α={total_ret-bh_ret:+.2%})")
+        if "buy_fill_rate" in i_stats:
+            print(f"  买填率: {i_stats['buy_fill_rate']:.0%}  卖填率: {i_stats['sell_fill_rate']:.0%}  "
+                  f"T+0触发: {i_stats['t0_trigger_rate']:.0%}")
+        else:
+            print(f"  触发: {i_stats.get('n_triggered', 0)}笔  成交: {i_stats.get('n_filled', 0)}笔  "
+                  f"填率: {i_stats.get('fill_rate', 0):.0%}  节省: {i_stats.get('total_savings', 0):+.2%}")
+        stats = pf_full.stats()
+        stats["intraday_return"] = intra_ret
+        stats["total_return"] = total_ret
+        stats["baseline_return"] = base_ret
+        stats["excess_return"] = excess
+        for k, v in i_stats.items():
+            if isinstance(v, (int, float, bool, str)):
+                stats[k] = v
+    else:
+        stats = pf_full.stats()
+
+    stats_path = f"{out_dir}/{safe_name}_stats.csv"
+    stats.to_csv(stats_path)
+    print(f"  Stats -> {stats_path}")
+
+    # ── Overview ──
+    n_rows = 5 if intraday_result is not None else 4
+    heights = [0.35, 0.18, 0.12, 0.15, 0.20] if intraday_result is not None else [0.45, 0.20, 0.15, 0.20]
+    titles = (
+        f"{name} - K线 + Polyfit基线",
+        "累积收益 (日内增强 vs 基准 vs BH)",
+        "持仓仓位",
+        "逐笔交易盈亏 (%)",
+    )
+    if intraday_result is not None:
+        titles = titles + ("日内 T+0 每日盈亏 (%)",)
+
+    fig_ov = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
+                           row_heights=heights, vertical_spacing=0.03,
+                           subplot_titles=titles)
+
+    df_aligned = df.loc[idx]
+
+    # Row 1: K线 + 基线 + 标记
+    fig_ov.add_trace(go.Candlestick(
+        x=idx, open=df_aligned["Open"], high=df_aligned["High"],
+        low=df_aligned["Low"], close=df_aligned["Close"],
+        name="K线", increasing_line_color="#ef5350", decreasing_line_color="#26a69a",
+    ), row=1, col=1)
+    if "PolyBasePred" in df.columns:
+        fig_ov.add_trace(go.Scatter(
+            x=idx, y=df_aligned["PolyBasePred"], mode="lines",
+            name="Polyfit基线", line=dict(color="#FF9800", width=1.5),
+        ), row=1, col=1)
+    e_dates = idx[entries.astype(bool)]
+    x_dates = idx[exits.astype(bool)]
+    fig_ov.add_trace(go.Scatter(x=e_dates, y=df_aligned.loc[e_dates, "Low"] * 0.995,
+        mode="markers", name="买入", marker=dict(color="red", size=6, symbol="triangle-up")), row=1, col=1)
+    fig_ov.add_trace(go.Scatter(x=x_dates, y=df_aligned.loc[x_dates, "High"] * 1.005,
+        mode="markers", name="卖出", marker=dict(color="green", size=6, symbol="triangle-down")), row=1, col=1)
+
+    # Row 2: 累积收益
+    bh_cum = close / close.iloc[0] - 1
+    base_nav = pf_full.value()
+    fig_ov.add_trace(go.Scatter(x=idx, y=bh_cum, mode="lines", name="Buy & Hold",
+        line=dict(color="gray", width=1, dash="dot")), row=2, col=1)
+    fig_ov.add_trace(go.Scatter(x=base_nav.index, y=base_nav - 1, mode="lines",
+        name="基准(开盘价)", line=dict(color="#2196F3", width=1.5)), row=2, col=1)
+    if intraday_result is not None:
+        intra_cum = intraday_result["intraday_cumulative"]
+        fig_ov.add_trace(go.Scatter(x=intra_cum.index, y=intra_cum - 1, mode="lines",
+            name="日内增量", line=dict(color="#FF5722", width=2)), row=2, col=1)
+
+    # Row 3: 仓位
+    pos = pf_full.position_mask().astype(float)
+    fig_ov.add_trace(go.Scatter(x=idx, y=pos, mode="lines", name="持仓",
+        line=dict(color="#4CAF50", width=1), fill="tozeroy"), row=3, col=1)
+
+    # Row 4: 交易盈亏
+    recs = pf_full.trades.records_readable
+    t_rets, t_dates = [], []
+    if len(recs) > 0:
+        for i in range(len(recs)):
+            r = float(recs["Return"].iloc[i])
+            if not pd.notna(r): continue
+            t_rets.append(r * 100)
+            ets = recs["Exit Timestamp"].iloc[i]
+            t_dates.append(pd.Timestamp(ets) if pd.notna(ets) else idx[-1])
+    t_colors = ["#4CAF50" if r > 0 else "#f44336" for r in t_rets]
+    fig_ov.add_trace(go.Bar(x=t_dates, y=t_rets, name="交易盈亏",
+        marker_color=t_colors, marker_line_width=0), row=4, col=1)
+
+    # Row 5: 日内每日盈亏（单日收益，不累计）
+    if intraday_result is not None and not intraday_result["daily_detail"].empty:
+        i_det = intraday_result["daily_detail"]
+        i_det_sorted = i_det.sort_values("date")
+        # 按类型分色：正收益暖色，负收益冷色
+        colors = ["#FF9800" if p > 0 else "#607D8B" for p in i_det_sorted["intraday_pnl"]]
+        fig_ov.add_trace(go.Bar(x=i_det_sorted["date"], y=i_det_sorted["intraday_pnl"] * 100,
+            name="日内单日盈亏", marker_color=colors, marker_line_width=0,
+            text=[f"{p:+.2%}" for p in i_det_sorted["intraday_pnl"]],
+            textposition="outside", textfont_size=9), row=5, col=1)
+
+    title_parts = [f"{name} — 日内限价单增强"]
+    if "buy_offset" in params:
+        title_parts.append(f"偏移={params['buy_offset']:.1%}")
+    if "cons_down_threshold" in params:
+        title_parts.append(f"连跌>={params['cons_down_threshold']}天")
+    fig_ov.update_layout(height=300 * n_rows, hovermode="x unified",
+                          title=" | ".join(title_parts))
+    fig_ov.update_xaxes(rangeslider_visible=False)
+    p_ov = f"{out_dir}/{safe_name}_overview.html"
+    fig_ov.write_html(p_ov)
+    print(f"  Overview (intraday) -> {p_ov}")
+
+    return {"name": name, "stats": stats, "params": params,
+            "out_dir": safe_name, "overview_html": f"{safe_name}_overview.html",
+            "plots": [("overview", f"{safe_name}_overview.html")]}
+

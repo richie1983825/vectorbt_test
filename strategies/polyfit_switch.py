@@ -728,6 +728,236 @@ def generate_grid_priority_switch_signals_v6(
 
 
 # ══════════════════════════════════════════════════════════════════
+# v7 — v6 + 顶部规避模块
+#
+# 基于 7 个历史顶部日的共同特征：
+#   短期急涨(5日>5%) + 高位(>80%) + 异常K线(大振幅/长上影/巨量阴线)
+#   → 后续3-10天跌3-5%
+#
+# 规避动作：
+#   1. 检测到顶部信号 → 强制离场 Switch 持仓
+#   2. 顶部信号后 N 天内禁止 Grid 新入场
+#   3. 顶部信号后 N 天内禁止 Switch 新入场
+# ══════════════════════════════════════════════════════════════════
+
+def generate_grid_priority_switch_signals_v7(
+    close: np.ndarray,
+    dev_pct: np.ndarray,
+    dev_trend: np.ndarray,
+    rolling_vol_pct: np.ndarray,
+    poly_base: np.ndarray,
+    grid_entries: np.ndarray,
+    grid_exits: np.ndarray,
+    ma20: np.ndarray | None = None,
+    ma60: np.ndarray | None = None,
+    # ── Switch 入场 ──
+    trend_entry_dp: float = 0.01,
+    trend_confirm_dp_slope: float = 0.0003,
+    # ── Switch 离场（v6 优化默认值）──
+    trend_atr_mult: float = 2.0,
+    trend_atr_window: int = 14,
+    trend_vol_climax: float = 3.0,
+    trend_decline_days: int = 2,
+    # ── OHLCV ──
+    high: np.ndarray | None = None,
+    low: np.ndarray | None = None,
+    open_: np.ndarray | None = None,
+    volume: np.ndarray | None = None,
+    # ── v6 增强开关 ──
+    enable_ohlcv_filter: bool = True,
+    enable_early_exit: bool = True,
+    # ── v7 顶部规避 ──
+    enable_top_avoidance: bool = True,
+    top_ret_5d: float = 0.05,          # 5日涨幅阈值
+    top_price_pos: float = 0.80,        # 20日价位阈值
+    top_amplitude: float = 0.025,       # 异常振幅阈值
+    top_block_days: int = 3,            # 顶部后禁止入场天数
+    # ── 调试 ──
+    return_filter_stats: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray] | dict:
+    """v7: OHLCV增强 + 顶部规避 Grid-priority Switch 策略。
+
+    在 v6 基础上增加顶部检测：
+      条件：5日涨幅>top_ret_5d AND 价位>top_price_pos AND 收阴
+            AND (振幅>top_amplitude OR 量异常)
+      动作：强制离场Switch + 禁止入场 top_block_days 天
+    """
+    n = len(close)
+    sw_entries = np.zeros(n, dtype=bool)
+    sw_exits = np.zeros(n, dtype=bool)
+    sw_sizes = np.ones(n) * 0.99
+
+    filter_stats = {"micro_up": 0, "long_upper_wick": 0, "normal_volume": 0,
+                    "green_without_momentum": 0, "high_position": 0, "passed": 0,
+                    "top_avoided": 0}
+
+    # Pre-compute ATR
+    _use_atr = high is not None and low is not None
+    atr_arr = np.zeros(n, dtype=np.float64)
+    if _use_atr:
+        alpha_a = 2.0 / (trend_atr_window + 1)
+        atr_ema = 0.0
+        for i in range(1, n):
+            if (np.isnan(high[i]) or np.isnan(low[i]) or np.isnan(close[i])
+                or np.isnan(close[i-1])):
+                continue
+            tr = max(high[i] - low[i], abs(high[i] - close[i-1]),
+                     abs(low[i] - close[i-1]))
+            atr_ema = tr if i == 1 else alpha_a * tr + (1.0 - alpha_a) * atr_ema
+            atr_arr[i] = atr_ema
+
+    # Pre-compute vol EMA
+    _use_vol = volume is not None
+    vol_ema_arr = np.zeros(n, dtype=np.float64)
+    if _use_vol:
+        alpha_v = 2.0 / 21.0
+        v_ema = float(volume[0]) if not np.isnan(volume[0]) else 0.0
+        vol_ema_arr[0] = v_ema
+        for i in range(1, n):
+            if not np.isnan(volume[i]):
+                v_ema = alpha_v * float(volume[i]) + (1.0 - alpha_v) * v_ema
+            vol_ema_arr[i] = v_ema
+
+    grid_in = False
+    sw_in = False
+    sw_peak = 0.0
+    sw_entry_bar = -1
+    prev_dp = np.nan
+    decline_count = 0
+    prev_ma20 = 0.0; prev_ma60 = 0.0
+
+    # 顶部规避状态
+    top_block_until = -1
+    top_signal_today = False
+
+    # 预计算20日高低
+    h20_arr = np.zeros(n, dtype=np.float64)
+    l20_arr = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        if i >= 19:
+            h20_arr[i] = np.max(high[max(0,i-19):i+1]) if high is not None else close[i]
+            l20_arr[i] = np.min(low[max(0,i-19):i+1]) if low is not None else close[i]
+
+    for i in range(n):
+        dp = dev_pct[i]; dt = dev_trend[i]; cl = close[i]
+        m20 = ma20[i] if ma20 is not None else 0.0
+        m60 = ma60[i] if ma60 is not None else 0.0
+        if np.isnan(dp) or np.isnan(dt) or np.isnan(cl) or cl <= 0:
+            prev_ma20 = m20; prev_ma60 = m60; continue
+
+        # ── v7 顶部检测 ──
+        top_signal_today = False
+        if enable_top_avoidance and i >= 20 and high is not None and low is not None:
+            ret_5d = close[i] / close[max(0, i-5)] - 1.0 if i >= 5 else 0.0
+            price_pos = (close[i] - l20_arr[i]) / (h20_arr[i] - l20_arr[i]) if h20_arr[i] > l20_arr[i] else 0.5
+            is_bearish = close[i] < open_[i] if open_ is not None else close[i] < close[i-1]
+            amplitude = (high[i] - low[i]) / close[i]
+            vol_ratio = volume[i] / vol_ema_arr[i] if _use_vol and vol_ema_arr[i] > 0 else 1.0
+
+            if (ret_5d > top_ret_5d and price_pos > top_price_pos and is_bearish
+                and amplitude > top_amplitude):
+                top_signal_today = True
+                top_block_until = i + top_block_days
+                # 强制离场 Switch
+                if sw_in:
+                    sw_exits[i] = True
+                    sw_in = False
+                    sw_peak = 0.0
+                filter_stats["top_avoided"] += 1
+
+        # ── 1. Grid exits first ──
+        grid_just_exited = False
+        if grid_in and grid_exits[i]:
+            grid_in = False
+            grid_just_exited = True
+
+        # ── 2. Grid entry = force Switch exit + Grid enters ──
+        #     但顶部规避期间禁止 Grid 入场
+        if grid_entries[i] and i > top_block_until:
+            if sw_in:
+                sw_exits[i] = True
+                sw_in = False
+                sw_peak = 0.0
+            grid_in = True
+            prev_ma20 = m20; prev_ma60 = m60
+            continue
+
+        # ── 3. Only if Grid is idle ──
+        if not grid_in and not grid_just_exited:
+            if not sw_in:
+                # 顶部规避期间禁止 Switch 入场
+                if i <= top_block_until:
+                    prev_ma20 = m20; prev_ma60 = m60
+                    continue
+
+                if dp >= trend_entry_dp:
+                    cond_s = dt > trend_confirm_dp_slope
+                    cond_m = (not np.isnan(m20) and not np.isnan(m60) and m20 > m60)
+                    if cond_s or cond_m:
+                        if enable_ohlcv_filter and i >= 10:
+                            feat = _compute_entry_ohlcv_features(
+                                close, open_, high, low, volume, vol_ema_arr, i)
+                            passed, reason = _check_entry_filters(
+                                feat, trend_entry_dp, trend_confirm_dp_slope)
+                            if not passed:
+                                filter_stats[reason] += 1
+                                prev_ma20 = m20; prev_ma60 = m60
+                                continue
+                            filter_stats["passed"] += 1
+
+                        sw_entries[i] = True
+                        sw_in = True
+                        sw_peak = cl
+                        sw_entry_bar = i
+                        decline_count = 0
+            else:
+                exit_now = False
+
+                if enable_early_exit and dp < -0.005 and decline_count >= 1:
+                    exit_now = True
+                elif trend_decline_days > 0 and decline_count >= trend_decline_days:
+                    exit_now = True
+                elif _use_atr and atr_arr[i] > 0:
+                    if cl <= sw_peak - trend_atr_mult * atr_arr[i]:
+                        exit_now = True
+                elif _use_vol:
+                    rv = volume[i] / max(vol_ema_arr[i], 1e-9)
+                    if rv > trend_vol_climax and i > 0 and cl > close[i-1]:
+                        exit_now = True
+                elif ma20 is not None and ma60 is not None:
+                    if (not np.isnan(m20) and not np.isnan(m60)
+                        and not np.isnan(prev_ma20) and not np.isnan(prev_ma60)
+                        and m20 < m60 and prev_ma20 >= prev_ma60):
+                        exit_now = True
+
+                if exit_now:
+                    sw_exits[i] = True
+                    sw_in = False
+                    sw_peak = 0.0
+                else:
+                    sw_peak = max(sw_peak, cl)
+
+        # dp decline tracking
+        if not np.isnan(prev_dp) and not np.isnan(dp):
+            if dp < prev_dp: decline_count += 1
+            else: decline_count = 0
+        prev_dp = dp
+        prev_ma20 = m20; prev_ma60 = m60
+
+    if sw_in:
+        sw_exits[-1] = True
+
+    if return_filter_stats:
+        return {
+            "sw_entries": sw_entries,
+            "sw_exits": sw_exits,
+            "sw_sizes": sw_sizes,
+            "filter_stats": filter_stats,
+        }
+    return sw_entries, sw_exits, sw_sizes
+
+
+# ══════════════════════════════════════════════════════════════════
 # GPU 批量信号生成 — CuPy RawKernel (v4)
 #
 # v4 改动：
