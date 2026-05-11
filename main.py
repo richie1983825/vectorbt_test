@@ -5,10 +5,13 @@ Stage 1: Grid WF (GPU, 缓存)
 Stage 2: Switch-v7 WF (CPU, V6固定base + 扫描顶部规避)
 V6 使用历史最优固定参数，不参与 WF 扫描。
 
-输出 Grid/Switch-v6/Switch-v7 的 return/balanced OOS 对比 + HTML 报告(V7策略)。
+用法:
+    uv run python main.py                          # 默认 sh512890
+    uv run python main.py sh512890                 # 指定标的
+    uv run python main.py sh563020 --force-rescan  # 强制重新扫描
 """
 
-import os, time, warnings
+import os, sys, time, warnings, argparse
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
@@ -35,7 +38,6 @@ V6_BEST_SWITCH = dict(trend_entry_dp=0.0, trend_confirm_dp_slope=0.0,
     trend_atr_mult=1.5, trend_atr_window=14, trend_vol_climax=2.5, trend_decline_days=1,
     enable_ohlcv_filter=True, enable_early_exit=True)
 
-# V7 base 参数（V6固定最优）
 V7_BASE_SWITCH = dict(trend_entry_dp=0.0, trend_confirm_dp_slope=0.0,
     trend_atr_mult=1.5, trend_atr_window=14, trend_vol_climax=2.5, trend_decline_days=1,
     enable_ohlcv_filter=True, enable_early_exit=True)
@@ -50,10 +52,32 @@ ALL_COMBOS = [
 ]
 
 
-def _print_combo_table(all_wf):
+def _parse_symbol(sym: str) -> tuple:
+    """解析股票代码，返回 (data_path, sym_name, display_name)。
+
+    sh512890 → data/1d/512890.SH_hfq.parquet, 512890_SH, 512890.SH
+    """
+    sym = sym.lower().strip()
+    if sym.startswith("sh"):
+        code, market = sym[2:], "SH"
+    elif sym.startswith("sz"):
+        code, market = sym[2:], "SZ"
+    else:
+        parts = sym.split(".")
+        code, market = parts[0], parts[1].upper()
+    path = f"data/1d/{code}.{market}_hfq.parquet"
+    sym_name = f"{code}_{market}"
+    display = f"{code}.{market}"
+    return path, sym_name, display
+
+
+def _print_combo_table(all_wf, display_name):
+    if all_wf.empty:
+        print(f"\n  (无有效 WF 结果)")
+        return None
     all_wf["excess"] = all_wf["test_return"] - all_wf["buy_hold_return"]
     print(f"\n{'═' * 100}")
-    print(f"  Grid vs Switch-v6 vs Switch-v7 — WF OOS 对比")
+    print(f"  {display_name} — Grid vs Switch-v6 vs Switch-v7 — WF OOS 对比")
     print(f"{'═' * 100}")
     print(f"  {'#':>2s} {'组合':<22s} {'OOS':>8s} {'α':>8s} {'Sharpe':>7s} {'maxDD':>7s} {'pos%':>5s} {'>BH':>5s}")
     print(f"  {'─'*2} {'─'*22} {'─'*8} {'─'*8} {'─'*7} {'─'*7} {'─'*5} {'─'*5}")
@@ -72,7 +96,6 @@ def _print_combo_table(all_wf):
 
 
 def _eval_v6_oos(close_warmup_all, open_, high, low, volume, test_offset):
-    """使用 V6 固定最优参数评估 OOS。"""
     from utils.backtest import run_backtest as _bt
 
     ind = compute_polyfit_switch_indicators(
@@ -115,8 +138,7 @@ def _eval_v6_oos(close_warmup_all, open_, high, low, volume, test_offset):
             "test_max_dd": m["max_drawdown"], "num_trades": m["num_trades"], "win_rate": m["win_rate"]}
 
 
-def _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, switch_df, df_report, REPORTS_DIR):
-    """使用 V7 WF 最优参数生成全量回测报告。"""
+def _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, switch_df, df_report, sym_name):
     from utils.backtest import run_backtest as _bt
     from utils.reports import generate_polyfit_switch_report
 
@@ -131,7 +153,6 @@ def _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, swit
     idx_s = sw_ind.index; cl_s = close_hfq.loc[idx_s]; op_s = open_raw.reindex(idx_s)
     hi_s = high_raw.reindex(idx_s); lo_s = low_raw.reindex(idx_s); vol_s = volume_raw.reindex(idx_s)
 
-    # Grid 信号（使用 V7 窗口的 Grid 参数）
     e_grid_s, x_grid_s, s_grid_s = generate_grid_signals(
         cl_s.values, sw_ind["PolyDevPct"].values, sw_ind["PolyDevTrend"].values,
         sw_ind["RollingVolPct"].values, sw_ind["PolyBasePred"].values,
@@ -148,7 +169,6 @@ def _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, swit
         position_sizing_coef=br.get("position_sizing_coef", 60),
     )
 
-    # V7 Switch 信号（含顶部规避）
     v7_top_params = {}
     for k in ["enable_top_avoidance", "top_ret_5d", "top_price_pos", "top_amplitude", "top_block_days"]:
         if k in br.index:
@@ -183,30 +203,57 @@ def _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, swit
 
     all_params = {**{k: br[k] for k in GRID_PARAMS_KEYS if k in br.index},
                   **V7_BASE_SWITCH, **v7_top_params}
+    name = f"Polyfit-Switch-v7-{sym_name}"
     return generate_polyfit_switch_report(df_report, cl_s, e_merged, x_merged, s_merged, modes_merged,
-        params=all_params, name="Polyfit-Switch-v7",
-        reports_dir=REPORTS_DIR, open_=op_s, pf_grid=pf_grid, pf_switch=pf_sw)
+        params=all_params, name=name, reports_dir=REPORTS_DIR, open_=op_s,
+        pf_grid=pf_grid, pf_switch=pf_sw)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="VectorBT Walk-Forward 回测")
+    parser.add_argument("symbol", nargs="?", default="sh512890",
+                        help="股票代码 (默认: sh512890)")
+    parser.add_argument("--force-rescan", action="store_true",
+                        help="强制重新扫描 Grid WF (忽略缓存)")
+    args = parser.parse_args()
+
+    data_path, sym_name, display_name = _parse_symbol(args.symbol)
+    if not os.path.exists(data_path):
+        print(f"错误: 数据文件不存在: {data_path}")
+        print(f"可用文件:")
+        for f in sorted(os.listdir("data/1d")):
+            if f.endswith("_hfq.parquet"):
+                print(f"  data/1d/{f}")
+        sys.exit(1)
+
     os.makedirs(REPORTS_DIR, exist_ok=True)
     gpu_info = detect_gpu(); print_gpu_info(gpu_info)
     _t0_total = time.time()
 
-    print("Loading data…")
-    data_hfq = load_data("data/1d/512890.SH_hfq.parquet")
+    print(f"标的: {display_name}  ({data_path})")
+    data_hfq = load_data(data_path)
     close_hfq = data_hfq["Close"]; open_raw = data_hfq["Open"]
     high_raw = data_hfq["High"]; low_raw = data_hfq["Low"]; volume_raw = data_hfq["Volume"]
     print(f"  {len(data_hfq)} bars  {data_hfq.index[0].date()} → {data_hfq.index[-1].date()}")
 
     windows = generate_monthly_windows(close_hfq.index, train_months=22, test_months=12,
                                         step_months=3, warmup_months=12)
+    if len(windows) == 0:
+        min_bars = 22 * 21 + 12 * 21 + 12 * 21  # ~ train + test + warmup
+        print(f"\n  错误: 数据太短 ({len(data_hfq)} bars)，至少需要约 {min_bars} 条日线")
+        print(f"  当前标的只有 {data_hfq.index[0].date()} → {data_hfq.index[-1].date()}，"
+              f"跨度 {(data_hfq.index[-1] - data_hfq.index[0]).days} 天")
+        sys.exit(1)
     print(f"  WF 窗口: {len(windows)} 个")
+
+    # 按标的隔离缓存文件
+    grid_cache_path = f"{REPORTS_DIR}/grid_wf_cache_{sym_name}.csv"
 
     # ── Stage 1: Grid WF ──
     print(f"\n{'═' * 70}\n  Stage 1/2: Polyfit-Grid Walk-Forward\n{'═' * 70}")
     t1 = time.time()
-    grid_df = run_grid_wf(close_hfq, open_raw, windows=windows, force_rescan=False)
+    grid_df = run_grid_wf(close_hfq, open_raw, windows=windows,
+                           force_rescan=args.force_rescan, cache_path=grid_cache_path)
     print(f"  Stage 1 done: {time.time()-t1:.0f}s")
 
     # ── Stage 2: Switch-v7 WF ──
@@ -216,7 +263,7 @@ if __name__ == "__main__":
                                windows=windows, grid_wf_df=grid_df)
     print(f"  Stage 2 done: {time.time()-t2:.0f}s")
 
-    # ── V6 OOS 评估（固定参数，每窗口执行）──
+    # ── V6 OOS 评估 ──
     print(f"\n  Evaluating V6 with fixed best params…")
     v6_rows = []
     for w in windows:
@@ -238,15 +285,15 @@ if __name__ == "__main__":
             })
     v6_df = pd.DataFrame(v6_rows)
 
-    # ── 合并输出 ──
     all_wf = pd.concat([grid_df, v6_df, switch_df], ignore_index=True)
-    all_wf.to_csv(f"{REPORTS_DIR}/wf_comparison.csv", index=False)
-    print(f"  Results → {REPORTS_DIR}/wf_comparison.csv")
+    wf_csv = f"{REPORTS_DIR}/wf_comparison_{sym_name}.csv"
+    all_wf.to_csv(wf_csv, index=False)
+    print(f"  Results → {wf_csv}")
 
-    best_name = _print_combo_table(all_wf)
+    best_name = _print_combo_table(all_wf, display_name)
 
-    # ── HTML 报告（V7 策略）──
-    print(f"\n{'═' * 70}\n  Generating HTML Reports — V7 策略\n{'═' * 70}")
+    # ── HTML 报告 ──
+    print(f"\n{'═' * 70}\n  Generating HTML Reports — V7 策略 ({display_name})\n{'═' * 70}")
     from utils.reports import generate_polyfit_grid_report, generate_polyfit_switch_report, build_index_html
 
     base_ind_full = compute_polyfit_base_only(close_hfq, fit_window_days=252, ma_windows=[])
@@ -273,10 +320,10 @@ if __name__ == "__main__":
             position_sizing_coef=br.get("position_sizing_coef",60),
         )
         reports_meta.append(generate_polyfit_grid_report(df_report, cl_g, e_g, x_g, s_g,
-            params={k:br[k] for k in GRID_PARAMS_KEYS if k in br.index}, name="Polyfit-Grid",
+            params={k:br[k] for k in GRID_PARAMS_KEYS if k in br.index}, name=f"Polyfit-Grid-{sym_name}",
             reports_dir=REPORTS_DIR, open_=op_g))
 
-    # Switch-v6 报告 (V6 固定最优参数)
+    # Switch-v6 报告
     sw_ind = compute_polyfit_switch_indicators(close_hfq, fit_window_days=252, ma_windows=[20,60],
                                                 trend_window_days=10, vol_window_days=10)
     idx_s = sw_ind.index; cl_s = close_hfq.loc[idx_s]; op_s = open_raw.reindex(idx_s)
@@ -308,18 +355,19 @@ if __name__ == "__main__":
     s_merged = np.where(e_grid_s, s_grid_s, sw_sz)
     modes_merged = np.zeros(len(e_merged), dtype=int); modes_merged[e_grid_s]=1; modes_merged[sw_e]=2
     reports_meta.append(generate_polyfit_switch_report(df_report, cl_s, e_merged, x_merged, s_merged, modes_merged,
-        params={**V6_BEST_GRID, **V6_BEST_SWITCH}, name="Polyfit-Switch-v6",
+        params={**V6_BEST_GRID, **V6_BEST_SWITCH}, name=f"Polyfit-Switch-v6-{sym_name}",
         reports_dir=REPORTS_DIR, open_=op_s, pf_grid=pf_grid, pf_switch=pf_sw))
 
-    # Switch-v7 报告 (WF 最优参数)
-    v7_report = _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, switch_df, df_report, REPORTS_DIR)
+    # Switch-v7 报告
+    v7_report = _generate_v7_report(close_hfq, open_raw, high_raw, low_raw, volume_raw, switch_df, df_report, sym_name)
     if v7_report:
         reports_meta.append(v7_report)
 
     if reports_meta:
-        with open(f"{REPORTS_DIR}/index.html", "w") as f:
+        index_path = f"{REPORTS_DIR}/index_{sym_name}.html"
+        with open(index_path, "w") as f:
             f.write(build_index_html(reports_meta, REPORTS_DIR))
-        print(f"  Index → {REPORTS_DIR}/index.html")
+        print(f"  Index → {index_path}")
 
     _dt_total = time.time() - _t0_total
     print(f"\n{'═' * 70}\n  总耗时: {_dt_total:.0f}s  ({_dt_total/60:.1f}min)\n{'═' * 70}")

@@ -36,11 +36,12 @@ GRID_PARAMS_KEYS = [
 SELECTORS = {"return": select_by_return, "balanced": select_balanced, "robust": select_robust}
 
 
-def load_grid_cache() -> dict:
+def load_grid_cache(cache_path: str = None) -> dict:
     """加载缓存的 Grid WF 结果。返回 {(test_start_date_str, selector): {params...}}"""
+    path = cache_path or GRID_CACHE_FILE
     cache = {}
-    if os.path.exists(GRID_CACHE_FILE):
-        df = pd.read_csv(GRID_CACHE_FILE)
+    if os.path.exists(path):
+        df = pd.read_csv(path)
         for _, r in df.iterrows():
             key = (str(r["test_start_date"])[:10], r["selector"])
             entry = {k: r[k] for k in GRID_PARAMS_KEYS if k in r.index}
@@ -101,6 +102,7 @@ def run_grid_wf(close: pd.Series, open_: pd.Series | None = None,
                 train_months: int = 22, test_months: int = 12,
                 step_months: int = 3, warmup_months: int = 12,
                 force_rescan: bool = False,
+                cache_path: str = None,
                 verbose: bool = True) -> pd.DataFrame:
     """运行 Polyfit-Grid Walk-Forward 扫描，缓存结果。
 
@@ -115,8 +117,9 @@ def run_grid_wf(close: pd.Series, open_: pd.Series | None = None,
             step_months=step_months, warmup_months=warmup_months,
         )
 
-    grid_cache = {} if force_rescan else load_grid_cache()
+    grid_cache = {} if force_rescan else load_grid_cache(cache_path)
     grid_eval = _make_grid_eval(open_)
+    _cache_file = cache_path or GRID_CACHE_FILE
     wf_rows = []
     n_proc = 0
     t0 = time.time()
@@ -203,13 +206,13 @@ def run_grid_wf(close: pd.Series, open_: pd.Series | None = None,
     cache_rows = []
     for (ts, sel), entry in grid_cache.items():
         cache_rows.append({"test_start_date": ts, "selector": sel, **entry})
-    pd.DataFrame(cache_rows).to_csv(GRID_CACHE_FILE, index=False)
+    pd.DataFrame(cache_rows).to_csv(_cache_file, index=False)
 
     wf_df = pd.DataFrame(wf_rows)
     if verbose:
         elapsed = time.time() - t0
         print(f"  Grid WF done: {len(wf_df)} rows, {elapsed:.0f}s, "
-              f"cache → {GRID_CACHE_FILE}")
+              f"cache → {_cache_file}")
 
     return wf_df
 

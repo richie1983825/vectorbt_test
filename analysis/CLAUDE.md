@@ -167,12 +167,11 @@ GPU kernel 分离 fill_price（成交价）和 close（NAV 估值价）。
 
 1. **默认使用 Walk-Forward**：所有回测必须以 Walk-Forward 方式运行（训练→OOS 测试），禁止仅在全量数据上扫描最优参数后直接报告"收益"——这会引入未来数据和严重过拟合偏差。
 
-2. **每次回测输出三种评分结果**：return / balanced / robust 必须同时列出，格式如下：
+2. **每次回测输出两种评分结果**：return / balanced 必须同时列出，格式如下：
    ```
    训练  评分       OOS       α        BH     sharpe   max_dd    pos    >BH    w
    22    return     +X%       +X%      +X%     X.XXX    -X%      X%    X%     X
    22    balanced   +X%       +X%      +X%     X.XXX    -X%      X%    X%     X
-   22    robust     +X%       +X%      +X%     X.XXX    -X%      X%    X%     X
    ```
 
 3. **训练月数是超参数**：不仅 22m/24m，训练窗口长度本身也需扫描（12-36 月，步长 1 月）。当前最优：22 个月。
@@ -183,6 +182,7 @@ GPU kernel 分离 fill_price（成交价）和 close（NAV 估值价）。
    - 参数选择仅在训练集上进行，测试集仅用于评估
 
 ### GPU 扫描耗时参考
+   - 当执行耗时明显超过上述时间，则需要提示用户定位分析
 
 | 扫描类型 | 组合数 | 耗时/窗口 | 说明 |
 |---------|--------|----------|------|
